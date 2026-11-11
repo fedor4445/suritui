@@ -34,7 +34,10 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::MissingRouter => {
-                write!(f, "no router address: set `router` in the config file or pass --router")
+                write!(
+                    f,
+                    "no router address: set `router` in the config file or pass --router"
+                )
             }
             ConfigError::Parse(m) => write!(f, "cannot read config: {m}"),
         }
@@ -84,7 +87,9 @@ impl Config {
                 .clone()
                 .or(file.rules_dir)
                 .unwrap_or_else(|| home.join(".local/share/suritui/rules")),
-            et_version: file.et_version.unwrap_or_else(|| DEFAULT_ET_VERSION.to_string()),
+            et_version: file
+                .et_version
+                .unwrap_or_else(|| DEFAULT_ET_VERSION.to_string()),
         })
     }
 
@@ -161,7 +166,10 @@ mod tests {
     #[test]
     fn flag_router_works_without_file() {
         let h = TempHome::new("nofile");
-        let o = Overrides { router: Some("192.0.2.1".into()), ..Default::default() };
+        let o = Overrides {
+            router: Some("192.0.2.1".into()),
+            ..Default::default()
+        };
         assert_eq!(Config::load(&o, &h.0).unwrap().router, "192.0.2.1");
     }
 

@@ -109,15 +109,10 @@ impl SshSource {
     }
 
     pub fn ssh_args(&self, r: Range) -> Vec<String> {
-        let mut args: Vec<String> = [
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let mut args: Vec<String> = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         args.push(self.target.clone());
         args.extend(r.remote_args());
         args
@@ -183,7 +178,15 @@ mod tests {
         for k in 0..=255u8 {
             let a = Range::Day(k).remote_args();
             assert!(a[1].parse::<u8>().unwrap() <= 13);
-            assert!(SshSource::new(&cfg()).ssh_args(Range::Day(k)).last().unwrap().parse::<u8>().unwrap() <= 13);
+            assert!(
+                SshSource::new(&cfg())
+                    .ssh_args(Range::Day(k))
+                    .last()
+                    .unwrap()
+                    .parse::<u8>()
+                    .unwrap()
+                    <= 13
+            );
         }
     }
 
@@ -201,7 +204,10 @@ mod tests {
                 "live"
             ]
         );
-        assert_eq!(s.ssh_args(Range::Day(2))[4..], ["alertview@198.51.100.1", "day", "2"]);
+        assert_eq!(
+            s.ssh_args(Range::Day(2))[4..],
+            ["alertview@198.51.100.1", "day", "2"]
+        );
     }
 
     #[test]
@@ -221,7 +227,10 @@ mod tests {
 
     #[test]
     fn exit_code_3_maps_to_no_such_day() {
-        assert_eq!(map_output(Some(3), b"", b"").unwrap_err(), SourceError::NoSuchDay);
+        assert_eq!(
+            map_output(Some(3), b"", b"").unwrap_err(),
+            SourceError::NoSuchDay
+        );
     }
 
     #[test]
@@ -229,7 +238,10 @@ mod tests {
         let e = map_output(Some(255), b"", b"Host key verification failed.\n").unwrap_err();
         assert_eq!(e, SourceError::Ssh("Host key verification failed.".into()));
         assert_eq!(e.to_string(), "Host key verification failed.");
-        assert!(matches!(map_output(None, b"", b"killed"), Err(SourceError::Ssh(_))));
+        assert!(matches!(
+            map_output(None, b"", b"killed"),
+            Err(SourceError::Ssh(_))
+        ));
     }
 
     #[test]

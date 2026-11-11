@@ -68,7 +68,10 @@ pub fn parse_line(line: &str) -> Option<Alert> {
     let al = v.get("alert");
     let get = |k: &str| al.and_then(|a| a.get(k));
     let md = get("metadata");
-    let mitre = match (meta(md, "mitre_technique_id"), meta(md, "mitre_technique_name")) {
+    let mitre = match (
+        meta(md, "mitre_technique_id"),
+        meta(md, "mitre_technique_name"),
+    ) {
         (Some(i), Some(n)) => Some(format!("{i} {n}")),
         (Some(i), None) => Some(i),
         (None, Some(n)) => Some(n),
@@ -86,8 +89,12 @@ pub fn parse_line(line: &str) -> Option<Alert> {
         action: text(get("action")),
         signature: text(get("signature")),
         sid: get("signature_id").and_then(Value::as_u64),
-        rev: get("rev").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
-        severity: get("severity").and_then(Value::as_u64).and_then(|n| u8::try_from(n).ok()),
+        rev: get("rev")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
+        severity: get("severity")
+            .and_then(Value::as_u64)
+            .and_then(|n| u8::try_from(n).ok()),
         et_severity: meta(md, "signature_severity"),
         confidence: meta(md, "confidence"),
         mitre,
@@ -170,9 +177,16 @@ mod tests {
     #[test]
     fn context_falls_back_to_tls_then_http() {
         let tls = r#"{"event_type":"alert","alert":{"signature":"x"},"tls":{"sni":"tls.example"},"http":{"hostname":"h.example"}}"#;
-        assert_eq!(parse_line(tls).unwrap().context.as_deref(), Some("tls.example"));
-        let http = r#"{"event_type":"alert","alert":{"signature":"x"},"http":{"hostname":"h.example"}}"#;
-        assert_eq!(parse_line(http).unwrap().context.as_deref(), Some("h.example"));
+        assert_eq!(
+            parse_line(tls).unwrap().context.as_deref(),
+            Some("tls.example")
+        );
+        let http =
+            r#"{"event_type":"alert","alert":{"signature":"x"},"http":{"hostname":"h.example"}}"#;
+        assert_eq!(
+            parse_line(http).unwrap().context.as_deref(),
+            Some("h.example")
+        );
     }
 
     #[test]
@@ -199,7 +213,10 @@ mod tests {
 
     #[test]
     fn category_et() {
-        assert_eq!(category("ET DNS Query for .cc TLD"), Category::Et("DNS".into()));
+        assert_eq!(
+            category("ET DNS Query for .cc TLD"),
+            Category::Et("DNS".into())
+        );
         assert_eq!(category("ET DNS Query for .cc TLD").label(), "DNS");
     }
 
@@ -211,7 +228,17 @@ mod tests {
 
     #[test]
     fn category_other_cases() {
-        for s in ["ET", "ET ", "ETPRO MALWARE x", "", "et dns", "SURICATA", "SURICATAfoo bar", "GPL ICMP", "-"] {
+        for s in [
+            "ET",
+            "ET ",
+            "ETPRO MALWARE x",
+            "",
+            "et dns",
+            "SURICATA",
+            "SURICATAfoo bar",
+            "GPL ICMP",
+            "-",
+        ] {
             assert_eq!(category(s), Category::Other, "{s:?}");
         }
         assert_eq!(Category::Other.label(), "Other");
@@ -219,7 +246,10 @@ mod tests {
 
     #[test]
     fn informational_by_et_severity() {
-        assert!(is_informational(&alert_with(Some(1), Some("Informational"))));
+        assert!(is_informational(&alert_with(
+            Some(1),
+            Some("Informational")
+        )));
         assert!(!is_informational(&alert_with(Some(3), Some("Minor"))));
     }
 
