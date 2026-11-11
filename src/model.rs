@@ -245,6 +245,11 @@ impl App {
         self.visible().get(self.selected).copied()
     }
 
+    /// Label of the selected sidebar category ("All" when none).
+    pub fn category(&self) -> &str {
+        &self.category
+    }
+
     pub fn selected_index(&self) -> usize {
         self.selected
     }
