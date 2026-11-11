@@ -19,6 +19,7 @@ pub enum RulesError {
     Io(String),
     Download(String),
     Archive(String),
+    NotARulesDir(String),
 }
 
 impl fmt::Display for RulesError {
@@ -28,6 +29,7 @@ impl fmt::Display for RulesError {
             RulesError::Io(e) => write!(f, "rules I/O error: {e}"),
             RulesError::Download(e) => write!(f, "rules download failed: {e}"),
             RulesError::Archive(e) => write!(f, "rules archive rejected: {e}"),
+            RulesError::NotARulesDir(e) => write!(f, "{e}"),
         }
     }
 }
@@ -174,6 +176,7 @@ fn install_with_cap<R: Read>(r: R, dir: &Path, cap: u64) -> Result<usize, RulesE
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => std::path::PathBuf::from("."),
     };
+    check_target(dir)?;
     std::fs::create_dir_all(&parent).map_err(io_err)?;
     let pid = std::process::id();
     let tmp = parent.join(format!(".{name}.new-{pid}"));
@@ -186,6 +189,37 @@ fn install_with_cap<R: Read>(r: R, dir: &Path, cap: u64) -> Result<usize, RulesE
         let _ = std::fs::remove_dir_all(&tmp);
     }
     result
+}
+
+/// Refuse to replace a directory that holds anything but `*.rules` regular
+/// files: a mistaken `rules_dir` (e.g. a home directory) must never be deleted.
+fn check_target(dir: &Path) -> Result<(), RulesError> {
+    let refuse = |why: &str| {
+        RulesError::NotARulesDir(format!(
+            "refusing to replace {}: {why}; check `rules_dir` in the config",
+            dir.display()
+        ))
+    };
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_err(e)),
+    };
+    if !meta.is_dir() {
+        return Err(refuse("it is not a plain directory"));
+    }
+    for entry in std::fs::read_dir(dir).map_err(io_err)? {
+        let entry = entry.map_err(io_err)?;
+        let is_file = entry.file_type().map_err(io_err)?.is_file();
+        let is_rules = entry.file_name().to_string_lossy().ends_with(".rules");
+        if !(is_file && is_rules) {
+            return Err(refuse(&format!(
+                "it contains {:?}, which is not a regular .rules file",
+                entry.file_name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Read the whole archive; write only regular `*.rules` entries, by file name.
@@ -250,7 +284,13 @@ fn swap_dirs(new: &Path, dir: &Path, old: &Path) -> Result<(), RulesError> {
     }
     if let Err(e) = std::fs::rename(new, dir) {
         if had_old {
-            let _ = std::fs::rename(old, dir);
+            if let Err(e2) = std::fs::rename(old, dir) {
+                return Err(RulesError::Io(format!(
+                    "{e}; restoring the old rules also failed ({e2}); \
+                     the old rules are now in {}",
+                    old.display()
+                )));
+            }
         }
         return Err(io_err(e));
     }
@@ -260,15 +300,24 @@ fn swap_dirs(new: &Path, dir: &Path, old: &Path) -> Result<(), RulesError> {
     Ok(())
 }
 
+/// HTTP agent. Without an override the default URL is https and redirects are
+/// restricted to https too (no plaintext downgrade); an override keeps its scheme.
+fn download_agent(url_override: Option<&str>) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .https_only(url_override.is_none())
+        .max_redirects(3)
+        .timeout_global(Some(std::time::Duration::from_secs(300)))
+        .build()
+        .into()
+}
+
 /// Download the ET Open rules tarball and install it into `cfg.rules_dir`.
 pub fn update_rules(cfg: &Config, url_override: Option<&str>) -> Result<usize, RulesError> {
     let url = url_override
         .map(str::to_string)
         .unwrap_or_else(|| rules_url(&cfg.et_version));
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(300)))
-        .build()
-        .into();
+    check_target(&cfg.rules_dir)?;
+    let agent = download_agent(url_override);
     let resp = agent
         .get(&url)
         .call()
@@ -609,5 +658,68 @@ mod tests {
         let e = update_rules(&cfg, Some("http://127.0.0.1:1/x.tar.gz")).unwrap_err();
         assert!(matches!(e, RulesError::Download(_)), "{e}");
         assert_eq!(names(&dir), ["old.rules"]);
+    }
+
+    #[test]
+    fn dir_with_foreign_file_is_refused_untouched() {
+        let t = TempDir::new("foreign");
+        let dir = t.0.join("home");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.rules"), RULE_A).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"precious").unwrap();
+        let tgz = tarball(&[("a.rules", RULE_B)]);
+        let e = install_from_tarball(&tgz[..], &dir).unwrap_err();
+        assert!(matches!(e, RulesError::NotARulesDir(_)), "{e}");
+        assert!(e.to_string().contains("rules_dir"));
+        assert_eq!(names(&dir), ["notes.txt", "old.rules"]);
+        assert_eq!(names(&t.0), ["home"]);
+    }
+
+    #[test]
+    fn dir_with_subdirectory_is_refused() {
+        let t = TempDir::new("subdir");
+        let dir = t.0.join("rules");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let tgz = tarball(&[("a.rules", RULE_B)]);
+        assert!(matches!(
+            install_from_tarball(&tgz[..], &dir),
+            Err(RulesError::NotARulesDir(_))
+        ));
+        assert_eq!(names(&dir), ["sub"]);
+    }
+
+    #[test]
+    fn dir_with_rules_symlink_is_refused() {
+        let t = TempDir::new("symlink");
+        let dir = t.0.join("rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", dir.join("l.rules")).unwrap();
+        let tgz = tarball(&[("a.rules", RULE_B)]);
+        assert!(matches!(
+            install_from_tarball(&tgz[..], &dir),
+            Err(RulesError::NotARulesDir(_))
+        ));
+    }
+
+    #[test]
+    fn empty_and_missing_dirs_are_accepted() {
+        let t = TempDir::new("emptydir");
+        let tgz = tarball(&[("a.rules", RULE_B)]);
+        let empty = t.0.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(install_from_tarball(&tgz[..], &empty).unwrap(), 1);
+        let missing = t.0.join("a/b/missing");
+        assert_eq!(install_from_tarball(&tgz[..], &missing).unwrap(), 1);
+        assert_eq!(names(&missing), ["a.rules"]);
+    }
+
+    #[test]
+    fn default_agent_is_https_only_with_few_redirects() {
+        let a = download_agent(None);
+        assert!(a.config().https_only());
+        assert_eq!(a.config().max_redirects(), 3);
+        assert!(!download_agent(Some("http://127.0.0.1:1/x"))
+            .config()
+            .https_only());
     }
 }
