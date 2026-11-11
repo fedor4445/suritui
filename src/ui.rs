@@ -89,7 +89,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
-    let w = area.width as usize;
+    // Keep the last column blank as a gap before the list.
+    let w = (area.width as usize).saturating_sub(1);
     let mut lines = vec![Line::from(Span::styled(
         fit("Categories", w),
         header_style(),
@@ -394,6 +395,36 @@ mod tests {
         assert!(all < scan);
         assert!(left[all].contains('3'));
         assert!(left.iter().any(|r| r.contains("DNS") && r.contains('2')));
+    }
+
+    #[test]
+    fn sidebar_count_is_separated_from_list_column() {
+        let alerts: Vec<Alert> = (0..1000)
+            .map(|i| {
+                alert(
+                    &format!("2026-11-10T10:{:02}:12.000000+0000", i % 60),
+                    "ET SCAN Probe",
+                    "allowed",
+                    None,
+                )
+            })
+            .collect();
+        let a = app(alerts);
+        let rows = render(&a, 100, 20);
+        let all: Vec<char> = rows
+            .iter()
+            .find(|r| r.starts_with("All"))
+            .unwrap()
+            .chars()
+            .collect();
+        let end = all
+            .iter()
+            .take(26)
+            .rposition(|c| c.is_ascii_digit())
+            .unwrap();
+        assert!(all[..26].iter().collect::<String>().contains("1000"));
+        assert_eq!(all[25], ' ');
+        assert!(end < 25);
     }
 
     #[test]
