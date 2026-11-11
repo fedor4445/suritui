@@ -138,14 +138,22 @@ impl App {
             .collect()
     }
 
-    /// Alerts hidden by the informational toggle in the current day (all categories).
+    /// Alerts hidden by the informational toggle, in the selected category
+    /// (same scope as `visible()`).
     pub fn hidden_count(&self) -> usize {
         if !self.hide_informational {
             return 0;
         }
+        let all = self.category == ALL;
         self.cache
             .get(&self.range)
-            .map(|l| l.alerts.iter().filter(|a| is_informational(a)).count())
+            .map(|l| {
+                l.alerts
+                    .iter()
+                    .filter(|a| is_informational(a))
+                    .filter(|a| all || category(&a.signature).label() == self.category)
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -160,10 +168,16 @@ impl App {
         } else {
             self.selected.min(len - 1)
         };
+        if len == 0 && matches!(self.mode, Mode::Detail | Mode::Rule | Mode::Raw) {
+            self.mode = Mode::List;
+        }
     }
 
     pub fn toggle_informational(&mut self) {
         self.hide_informational = !self.hide_informational;
+        // The list changed: leave any detail/rule/raw/help view (Help included,
+        // so the user is never stranded in Help after a list change).
+        self.mode = Mode::List;
         self.normalize();
     }
 
@@ -176,6 +190,7 @@ impl App {
         let n = cats.len() as isize;
         self.category = cats[(pos + delta).rem_euclid(n) as usize].0.clone();
         self.selected = 0;
+        self.mode = Mode::List;
         self.normalize();
     }
 
@@ -199,7 +214,7 @@ impl App {
 
     /// Positive delta = older. Never goes below Today or above Day(13).
     pub fn change_day(&mut self, delta: i32) {
-        let target = (day_index(self.range) + delta).clamp(0, MAX_DAY as i32 + 1);
+        let target = (day_index(self.range).saturating_add(delta)).clamp(0, MAX_DAY as i32 + 1);
         let r = if target == 0 {
             Range::Today
         } else {
@@ -208,18 +223,21 @@ impl App {
         if r == self.range {
             return;
         }
-        if !self.cache.contains_key(&r) && !self.fetch(r) {
+        // Today is live and never served from the cache; only Day(k) is cached.
+        if (r == Range::Today || !self.cache.contains_key(&r)) && !self.fetch(r) {
             return;
         }
         self.status.clear();
         self.range = r;
         self.selected = 0;
+        self.mode = Mode::List;
         self.normalize();
     }
 
     pub fn refresh(&mut self) {
         let r = self.range;
         self.fetch(r);
+        self.mode = Mode::List;
         self.normalize();
     }
 
@@ -255,15 +273,17 @@ impl App {
             return self.status.clone();
         }
         let shown = self.visible().len();
-        let mut s = if shown == 0 {
+        let hidden = self.hidden_count();
+        let mut s = if shown == 0 && hidden == 0 {
             "0 alerts in this range".to_string()
-        } else if self.hide_informational {
+        } else if hidden > 0 {
             format!(
-                "{shown} shown, {} hidden (informational)",
-                group(self.hidden_count())
+                "{} shown, {} hidden (informational)",
+                group(shown),
+                group(hidden)
             )
         } else {
-            format!("{shown} shown")
+            format!("{} shown", group(shown))
         };
         let skipped = self.cache.get(&self.range).map_or(0, |l| l.skipped);
         if skipped > 0 {
@@ -510,6 +530,88 @@ mod tests {
             .filter(|r| **r == Range::Day(0))
             .count();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn today_is_reloaded_on_return_but_day_is_cached() {
+        let mut h = harness(sample(), 0, None);
+        h.app.change_day(1);
+        h.app.change_day(-1);
+        h.app.change_day(1);
+        h.app.change_day(-1);
+        let n = |h: &H, r| h.calls.borrow().iter().filter(|c| **c == r).count();
+        assert_eq!(n(&h, Range::Day(0)), 1);
+        assert_eq!(n(&h, Range::Today), 3); // initial + two returns
+        h.data
+            .borrow_mut()
+            .insert(Range::Today, Ok(vec![alert("t", "ET X y", None, false)]));
+        h.app.change_day(1);
+        h.app.change_day(-1);
+        assert_eq!(h.app.visible().len(), 1);
+        // failed reload keeps old data, stays on Day(0), shows error
+        h.data
+            .borrow_mut()
+            .insert(Range::Today, Err(SourceError::Ssh("down".into())));
+        h.app.change_day(1);
+        h.app.change_day(-1);
+        assert_eq!(h.app.range, Range::Day(0));
+        assert_eq!(h.app.status_line(), "down");
+    }
+
+    #[test]
+    fn mode_returns_to_list_after_list_changing_actions() {
+        for action in 0..5 {
+            let mut h = harness(sample(), 0, None);
+            h.data
+                .borrow_mut()
+                .insert(Range::Day(0), Ok(vec![alert("t", "ET X y", None, false)]));
+            h.app.mode = Mode::Detail;
+            match action {
+                0 => h.app.toggle_informational(),
+                1 => h.app.next_category(),
+                2 => h.app.prev_category(),
+                3 => h.app.change_day(1),
+                _ => h.app.refresh(),
+            }
+            assert_eq!(h.app.mode, Mode::List, "action {action}");
+        }
+        let mut h = harness(sample(), 0, None);
+        h.app.mode = Mode::Help;
+        h.app.refresh();
+        assert_eq!(h.app.mode, Mode::List);
+    }
+
+    #[test]
+    fn mode_demoted_when_list_becomes_empty() {
+        for m in [Mode::Detail, Mode::Rule, Mode::Raw] {
+            let mut h = harness(sample(), 0, None);
+            h.app.mode = m;
+            h.data.borrow_mut().insert(Range::Today, Ok(vec![]));
+            h.app.refresh();
+            assert_eq!(h.app.mode, Mode::List);
+        }
+    }
+
+    #[test]
+    fn status_forms_when_toggle_hides_everything() {
+        let mut h = harness(
+            vec![
+                alert("1", "ET INFO a", None, true),
+                alert("2", "ET INFO b", None, true),
+            ],
+            0,
+            None,
+        );
+        h.app.toggle_informational();
+        assert_eq!(h.app.status_line(), "0 shown, 2 hidden (informational)");
+        let mut e = harness(vec![], 0, None);
+        e.app.toggle_informational();
+        assert_eq!(e.app.status_line(), "0 alerts in this range");
+        let mut c = harness(sample(), 0, None);
+        c.app.toggle_informational();
+        c.app.next_category(); // DROP first (ties alphabetical): scope check below
+        c.app.next_category(); // SCAN: 1 shown, 1 hidden in this category
+        assert_eq!(c.app.status_line(), "1 shown, 1 hidden (informational)");
     }
 
     #[test]
