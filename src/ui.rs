@@ -74,18 +74,42 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Raw => draw_raw(f, app, body),
         Mode::Help => draw_help(f, body),
     }
-    let hint = if app.mode == Mode::List {
-        "  ? help"
-    } else {
-        "  Esc back"
+    let hint = match app.mode {
+        Mode::List => "  ? help",
+        Mode::Detail => "  Esc back   r rule text   w raw JSON",
+        _ => "  Esc back",
     };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(clean(&app.status_line())),
-            Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),
-        ])),
-        status,
-    );
+    let left = Paragraph::new(Line::from(vec![
+        Span::raw(clean(&app.status_line())),
+        Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),
+    ]));
+    // The scroll indicator has priority over the status text on narrow
+    // terminals; it is right-aligned and never wider than the row.
+    match scroll_indicator(app) {
+        Some(ind) => {
+            let iw = (ind.chars().count() as u16).min(status.width);
+            let [l, r] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(iw)]).areas(status);
+            f.render_widget(left, l);
+            f.render_widget(Paragraph::new(ind), r);
+        }
+        None => f.render_widget(left, status),
+    }
+}
+
+/// `lines 5-22 of 41` when the current screen scrolls and does not fit.
+fn scroll_indicator(app: &App) -> Option<String> {
+    let (content, vh) = app.last_view()?;
+    if vh == 0 || content <= vh {
+        return None;
+    }
+    let top = app.scroll_top(content, vh);
+    Some(format!(
+        "lines {}-{} of {}",
+        top + 1,
+        (top + vh).min(content),
+        content
+    ))
 }
 
 fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
@@ -211,12 +235,69 @@ fn screen(f: &mut Frame, area: Rect, title: &str, mut lines: Vec<Line<'static>>)
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
+/// Hard-wrap a line at `w` characters (the program counts characters, not
+/// display cells, everywhere), keeping span styles. An empty line stays one
+/// row, so the result is exactly the rows the screen will show.
+fn wrap_line(line: Line<'static>, w: usize) -> Vec<Line<'static>> {
+    let w = w.max(1);
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0;
+    for span in line.spans {
+        let mut buf = String::new();
+        for c in span.content.chars() {
+            if used == w {
+                if !buf.is_empty() {
+                    rows.last_mut()
+                        .unwrap()
+                        .push(Span::styled(std::mem::take(&mut buf), span.style));
+                }
+                rows.push(Vec::new());
+                used = 0;
+            }
+            buf.push(c);
+            used += 1;
+        }
+        if !buf.is_empty() {
+            rows.last_mut().unwrap().push(Span::styled(buf, span.style));
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
+}
+
+/// A screen with a pinned title and scrollable, hard-wrapped content. Records
+/// the wrapped content height and viewport for the key handler; the offset is
+/// clamped here too, so a resize cannot leave it out of range.
+fn scroll_screen(f: &mut Frame, app: &App, area: Rect, title: &str, lines: Vec<Line<'static>>) {
+    let rows: Vec<Line<'static>> = lines
+        .into_iter()
+        .flat_map(|l| wrap_line(l, area.width as usize))
+        .collect();
+    let vh = (area.height as usize).saturating_sub(1);
+    app.record_view(rows.len(), vh);
+    let top = app.scroll_top(rows.len(), vh);
+    let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(title.to_string(), header_style()))),
+        head,
+    );
+    f.render_widget(
+        Paragraph::new(rows.into_iter().skip(top).take(vh).collect::<Vec<_>>()),
+        body,
+    );
+}
+
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let Some(a) = app.selected() else {
-        return screen(f, area, "Alert", vec![Line::from("No alert selected.")]);
+        return scroll_screen(
+            f,
+            app,
+            area,
+            "Alert",
+            vec![Line::from("No alert selected.")],
+        );
     };
     let opt = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
-    let mut lines = vec![
+    let lines = vec![
         field("Signature", &a.signature),
         field("Time", &a.ts),
         field(
@@ -256,12 +337,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         field("Created", &opt(a.created_at.clone())),
         field("Updated", &opt(a.updated_at.clone())),
     ];
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "Esc back   r rule text   w raw JSON",
-        Style::default().add_modifier(Modifier::DIM),
-    )));
-    screen(f, area, "Alert", lines);
+    scroll_screen(f, app, area, "Alert", lines);
 }
 
 fn draw_rule(f: &mut Frame, app: &App, area: Rect) {
@@ -302,7 +378,7 @@ fn draw_raw(f: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_default();
     let lines = text.lines().map(plain).collect();
-    screen(f, area, "Raw JSON", lines);
+    scroll_screen(f, app, area, "Raw JSON", lines);
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
@@ -311,6 +387,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("j k, Down Up", "move in the list"),
         ("g G, Home End", "first / last row"),
         ("PgUp PgDn", "move 20 rows"),
+        ("j k, PgUp PgDn, g G", "scroll (detail and raw)"),
         ("Enter", "alert detail"),
         ("Esc", "back to the list"),
         ("i", "show / hide informational alerts"),
@@ -331,7 +408,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
 fn field_wide(k: &str, d: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("{k:<18}"),
+            format!("{k:<21}"),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(d.to_string()),
@@ -735,5 +812,349 @@ mod tests {
         let s = screen(&sample(), 120, 20);
         assert!(s.contains("ET SCAN Probe") && !s.contains('?') || s.contains("? help"));
         assert_eq!(clean("ET SCAN Probe é 日本"), "ET SCAN Probe é 日本");
+    }
+
+    // ---- scrolling ----
+
+    use crate::input::handle_key;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(a: &mut App, c: KeyCode) {
+        handle_key(a, KeyEvent::new(c, KeyModifiers::NONE));
+    }
+    fn key(a: &mut App, ch: char) {
+        press(a, KeyCode::Char(ch));
+    }
+
+    /// One alert whose raw JSON pretty-prints to 42 lines (40 keys).
+    fn long_app() -> App {
+        let mut al = alert(
+            "2026-11-10T10:11:12.000000+0000",
+            "ET SCAN Probe",
+            "allowed",
+            None,
+        );
+        let body: Vec<String> = (0..40)
+            .map(|i| format!("\"key{i:02}\":\"val{i:02}\""))
+            .collect();
+        al.raw = format!("{{{}}}", body.join(","));
+        app(vec![al])
+    }
+
+    fn mode_app(m: Mode) -> App {
+        let mut a = long_app();
+        a.set_mode(m);
+        a
+    }
+
+    /// First content row (below the title) of a w x h render.
+    fn first_line(a: &App, w: u16, h: u16) -> String {
+        render(a, w, h)[1].trim_end().to_string()
+    }
+    fn footer(a: &App, w: u16, h: u16) -> String {
+        render(a, w, h)[h as usize - 1].trim_end().to_string()
+    }
+
+    #[test]
+    fn raw_scrolls_with_j_k_and_arrows() {
+        let mut a = mode_app(Mode::Raw);
+        let top = first_line(&a, 60, 10);
+        assert_eq!(top, "{");
+        key(&mut a, 'j');
+        assert_eq!(first_line(&a, 60, 10), "  \"key00\": \"val00\",");
+        press(&mut a, KeyCode::Down);
+        assert_eq!(first_line(&a, 60, 10), "  \"key01\": \"val01\",");
+        key(&mut a, 'k');
+        press(&mut a, KeyCode::Up);
+        assert_eq!(first_line(&a, 60, 10), top);
+    }
+
+    #[test]
+    fn detail_scrolls_and_pages() {
+        let mut a = mode_app(Mode::Detail);
+        assert!(first_line(&a, 60, 10).starts_with("Signature"));
+        key(&mut a, 'j');
+        assert!(first_line(&a, 60, 10).starts_with("Time"));
+        key(&mut a, 'k');
+        assert!(first_line(&a, 60, 10).starts_with("Signature"));
+        // viewport = 10 - 1 status - 1 title = 8 rows; page = 7
+        press(&mut a, KeyCode::PageDown);
+        assert!(
+            first_line(&a, 60, 10).starts_with("SID / rev"),
+            "{}",
+            first_line(&a, 60, 10)
+        );
+        press(&mut a, KeyCode::PageUp);
+        assert!(first_line(&a, 60, 10).starts_with("Signature"));
+    }
+
+    #[test]
+    fn raw_pages_g_and_big_g() {
+        let mut a = mode_app(Mode::Raw);
+        render(&a, 60, 10);
+        key(&mut a, 'G');
+        assert_eq!(first_line(&a, 60, 10), "  \"key33\": \"val33\",");
+        assert!(render(&a, 60, 10)[8].starts_with("}"));
+        key(&mut a, 'g');
+        assert_eq!(first_line(&a, 60, 10), "{");
+        press(&mut a, KeyCode::End);
+        assert!(render(&a, 60, 10)[8].starts_with("}"));
+        press(&mut a, KeyCode::Home);
+        assert_eq!(first_line(&a, 60, 10), "{");
+        press(&mut a, KeyCode::PageDown);
+        assert_eq!(first_line(&a, 60, 10), "  \"key06\": \"val06\",");
+        press(&mut a, KeyCode::PageUp);
+        assert_eq!(first_line(&a, 60, 10), "{");
+    }
+
+    #[test]
+    fn scrolling_is_clamped_at_both_ends() {
+        let mut a = mode_app(Mode::Raw);
+        render(&a, 60, 10);
+        key(&mut a, 'k');
+        assert_eq!(first_line(&a, 60, 10), "{");
+        key(&mut a, 'G');
+        let bottom = first_line(&a, 60, 10);
+        key(&mut a, 'j');
+        press(&mut a, KeyCode::PageDown);
+        assert_eq!(first_line(&a, 60, 10), bottom);
+        // no hidden overshoot: one k moves exactly one line up
+        key(&mut a, 'k');
+        assert_eq!(first_line(&a, 60, 10), "  \"key32\": \"val32\",");
+        // same for the top after a page up
+        key(&mut a, 'g');
+        press(&mut a, KeyCode::PageUp);
+        key(&mut a, 'j');
+        assert_eq!(first_line(&a, 60, 10), "  \"key00\": \"val00\",");
+    }
+
+    #[test]
+    fn scroll_resets_on_mode_change() {
+        let mut a = mode_app(Mode::Detail);
+        render(&a, 60, 10);
+        key(&mut a, 'G');
+        render(&a, 60, 10);
+        key(&mut a, 'w');
+        assert_eq!(a.mode, Mode::Raw);
+        assert_eq!(first_line(&a, 60, 10), "{");
+        key(&mut a, 'G');
+        render(&a, 60, 10);
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Enter);
+        assert!(first_line(&a, 60, 10).starts_with("Signature"));
+        key(&mut a, 'G');
+        render(&a, 60, 10);
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Enter);
+        key(&mut a, 'w');
+        assert_eq!(first_line(&a, 60, 10), "{");
+    }
+
+    #[test]
+    fn scroll_resets_when_alert_changes() {
+        let mut a = app(vec![
+            alert(
+                "2026-11-10T10:00:00.000000+0000",
+                "ET A one",
+                "allowed",
+                None,
+            ),
+            alert(
+                "2026-11-10T09:00:00.000000+0000",
+                "ET B two",
+                "allowed",
+                None,
+            ),
+        ]);
+        a.set_mode(Mode::Detail);
+        render(&a, 60, 8);
+        key(&mut a, 'G');
+        assert!(!first_line(&a, 60, 8).starts_with("Signature"));
+        // the selection moves under the screen (model-level change)
+        a.move_selection(1);
+        assert!(first_line(&a, 60, 8).starts_with("Signature"));
+    }
+
+    #[test]
+    fn scroll_resets_when_model_demotes_mode() {
+        let mut a = mode_app(Mode::Raw);
+        render(&a, 60, 10);
+        key(&mut a, 'G');
+        a.refresh();
+        assert_eq!(a.mode, Mode::List);
+        press(&mut a, KeyCode::Enter);
+        key(&mut a, 'w');
+        assert_eq!(first_line(&a, 60, 10), "{");
+    }
+
+    #[test]
+    fn content_that_fits_does_not_scroll_and_has_no_indicator() {
+        let mut a = mode_app(Mode::Detail);
+        let before = render(&a, 80, 40);
+        for c in [
+            KeyCode::Char('j'),
+            KeyCode::PageDown,
+            KeyCode::Char('G'),
+            KeyCode::End,
+        ] {
+            press(&mut a, c);
+            assert_eq!(render(&a, 80, 40), before);
+        }
+        assert!(!footer(&a, 80, 40).contains("lines"));
+        assert!(footer(&a, 80, 40).contains("w raw JSON"));
+    }
+
+    #[test]
+    fn indicator_shows_visible_range() {
+        let mut a = mode_app(Mode::Raw);
+        // 42 content lines, 8 rows
+        assert!(
+            footer(&a, 100, 10).contains("lines 1-8 of 42"),
+            "{}",
+            footer(&a, 100, 10)
+        );
+        key(&mut a, 'j');
+        assert!(footer(&a, 100, 10).contains("lines 2-9 of 42"));
+        key(&mut a, 'G');
+        assert!(footer(&a, 100, 10).contains("lines 35-42 of 42"));
+        let d = mode_app(Mode::Detail);
+        let f = footer(&d, 100, 10);
+        assert!(f.contains("lines 1-8 of 20"), "{f}");
+        assert!(f.contains("Esc back") && f.contains("r rule text") && f.contains("w raw JSON"));
+    }
+
+    #[test]
+    fn footer_fits_narrow_terminals() {
+        let a = mode_app(Mode::Detail);
+        for w in [1u16, 5, 12, 20, 40] {
+            let f = footer(&a, w, 6);
+            assert!(f.chars().count() <= w as usize);
+        }
+        assert!(footer(&a, 20, 6).contains("lines 1-4 of"));
+    }
+
+    #[test]
+    fn resize_keeps_offset_valid() {
+        let mut a = mode_app(Mode::Raw);
+        render(&a, 100, 30);
+        key(&mut a, 'G');
+        let big = render(&a, 100, 30);
+        assert!(big[28].starts_with("}"));
+        // offset 14 is still valid in 8 rows
+        assert!(footer(&a, 100, 10).contains("lines 15-22 of 42"));
+        key(&mut a, 'G');
+        assert!(render(&a, 100, 10)[8].starts_with("}"));
+        // back to a tall screen: the offset is clamped to the new maximum
+        let big = render(&a, 100, 30);
+        assert!(big[28].starts_with("}"), "{big:?}");
+        let tall = render(&a, 100, 50);
+        assert_eq!(tall[1].trim_end(), "{");
+        assert!(!tall[49].contains("lines"));
+        // after the clamp, k moves exactly one line from the clamped offset
+        render(&a, 100, 30);
+        key(&mut a, 'G');
+        render(&a, 100, 50);
+        key(&mut a, 'k');
+        assert_eq!(first_line(&a, 100, 50), "{");
+    }
+
+    #[test]
+    fn long_wrapped_line_counts_as_many_lines() {
+        let mut al = alert("2026-11-10T10:11:12.000000+0000", "ET X y", "allowed", None);
+        al.raw = format!("{{\"a\":\"{}\"}}", "z".repeat(200));
+        let mut a = app(vec![al]);
+        a.set_mode(Mode::Raw);
+        // 3 JSON lines, the middle one wraps at width 20 into 11 rows
+        let f = footer(&a, 20, 8);
+        assert!(f.contains("of 13"), "{f}");
+        key(&mut a, 'G');
+        let rows = render(&a, 20, 8);
+        assert!(rows[6].starts_with("}"), "{rows:?}");
+        assert!(rows[5].contains('z'));
+    }
+
+    #[test]
+    fn list_keys_do_not_leak_into_scrolled_modes() {
+        for m in [Mode::Detail, Mode::Raw] {
+            let mut a = mode_app(m);
+            render(&a, 60, 10);
+            for c in [
+                KeyCode::Tab,
+                KeyCode::Char('i'),
+                KeyCode::Char('['),
+                KeyCode::Char(']'),
+                KeyCode::Char('R'),
+                KeyCode::Char('?'),
+            ] {
+                press(&mut a, c);
+                assert_eq!(a.mode, m);
+                assert_eq!(first_line(&a, 60, 10).trim_end(), first_line(&a, 60, 10));
+            }
+            assert!(!a.hide_informational);
+        }
+    }
+
+    #[test]
+    fn rule_and_help_do_not_scroll() {
+        for m in [Mode::Rule, Mode::Help] {
+            let mut a = mode_app(m);
+            let before = render(&a, 60, 6);
+            for c in [
+                KeyCode::Char('j'),
+                KeyCode::Char('G'),
+                KeyCode::PageDown,
+                KeyCode::Down,
+            ] {
+                press(&mut a, c);
+                assert_eq!(a.mode, m);
+                assert_eq!(render(&a, 60, 6), before);
+            }
+        }
+    }
+
+    #[test]
+    fn scrolled_screens_do_not_panic_when_tiny() {
+        for m in [Mode::Detail, Mode::Raw] {
+            for (w, h) in [
+                (40, 10),
+                (20, 5),
+                (20, 1),
+                (1, 1),
+                (0, 0),
+                (5, 2),
+                (200, 3),
+                (20, 2),
+                (3, 40),
+            ] {
+                let mut a = mode_app(m);
+                render(&a, 100, 30);
+                for c in [
+                    KeyCode::Char('G'),
+                    KeyCode::PageDown,
+                    KeyCode::Char('j'),
+                    KeyCode::PageUp,
+                    KeyCode::Char('k'),
+                ] {
+                    press(&mut a, c);
+                    render(&a, w, h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scrolled_text_is_still_cleaned() {
+        let mut a = hostile_app();
+        a.set_mode(Mode::Raw);
+        render(&a, 20, 4);
+        key(&mut a, 'G');
+        assert_clean(&screen(&a, 20, 4));
+    }
+
+    #[test]
+    fn help_mentions_scroll_keys() {
+        let mut a = sample();
+        a.mode = Mode::Help;
+        assert!(screen(&a, 100, 24).contains("scroll (detail and raw)"));
     }
 }

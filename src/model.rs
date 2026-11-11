@@ -4,6 +4,7 @@ use crate::alert::{category, is_informational, Alert};
 use crate::config::Config;
 use crate::rules::{rev_warning, RuleIndex};
 use crate::source::{AlertSource, Loaded, Range, SourceError};
+use std::cell::Cell;
 use std::collections::HashMap;
 
 const MAX_DAY: u8 = 13;
@@ -16,6 +17,33 @@ pub enum Mode {
     Rule,
     Raw,
     Help,
+}
+
+impl Mode {
+    /// Screens that scroll. Adding `Mode::Rule` here (and drawing it with
+    /// `scroll_screen` in ui.rs) is all it takes to scroll the rule screen.
+    pub fn scrolls(self) -> bool {
+        matches!(self, Mode::Detail | Mode::Raw)
+    }
+}
+
+/// What the last draw learned about the scrolling screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewFacts {
+    mode: Mode,
+    /// Wrapped content lines (title excluded).
+    content: usize,
+    /// Rows available for content.
+    viewport: usize,
+}
+
+/// Scroll offset together with the (mode, selection) it belongs to; it only
+/// counts while both still match, so any change of either reads as the top.
+#[derive(Debug, Clone, Copy)]
+struct Scroll {
+    mode: Mode,
+    selected: usize,
+    top: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -40,6 +68,11 @@ pub struct App {
     pub status: String,
     category: String,
     selected: usize,
+    scroll: Scroll,
+    /// The one piece of interior mutability: `ui::draw` only gets `&App`, but
+    /// the key handler needs the real content/viewport heights of the last
+    /// frame to clamp scrolling.
+    view: Cell<Option<ViewFacts>>,
 }
 
 fn newest_first(mut l: Loaded) -> Loaded {
@@ -67,6 +100,12 @@ impl App {
             status: String::new(),
             category: ALL.to_string(),
             selected: 0,
+            scroll: Scroll {
+                mode: Mode::List,
+                selected: 0,
+                top: 0,
+            },
+            view: Cell::new(None),
         };
         app.fetch(Range::Today);
         app
@@ -169,8 +208,89 @@ impl App {
             self.selected.min(len - 1)
         };
         if len == 0 && matches!(self.mode, Mode::Detail | Mode::Rule | Mode::Raw) {
-            self.mode = Mode::List;
+            self.set_mode(Mode::List);
         }
+    }
+
+    /// Change screen; the scroll position goes back to the top.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.scroll = Scroll {
+            mode,
+            selected: self.selected,
+            top: 0,
+        };
+    }
+
+    /// (content, viewport) of the last draw, if it was for the current screen.
+    pub fn last_view(&self) -> Option<(usize, usize)> {
+        self.view
+            .get()
+            .filter(|v| v.mode == self.mode)
+            .map(|v| (v.content, v.viewport))
+    }
+
+    /// Called by `ui::draw` for a scrolling screen.
+    pub fn record_view(&self, content: usize, viewport: usize) {
+        self.view.set(Some(ViewFacts {
+            mode: self.mode,
+            content,
+            viewport,
+        }));
+    }
+
+    /// First visible content line for a screen of `content` lines in
+    /// `viewport` rows, clamped so a resize never leaves it out of range.
+    pub fn scroll_top(&self, content: usize, viewport: usize) -> usize {
+        let max = content.saturating_sub(viewport);
+        self.raw_top().min(max)
+    }
+
+    fn raw_top(&self) -> usize {
+        let s = self.scroll;
+        if s.mode == self.mode && s.selected == self.selected {
+            s.top
+        } else {
+            0
+        }
+    }
+
+    fn move_scroll(&mut self, f: impl FnOnce(usize, usize, usize) -> usize) {
+        if !self.mode.scrolls() {
+            return;
+        }
+        // Facts from another screen (no draw since the switch) count as none.
+        let Some(v) = self.view.get().filter(|v| v.mode == self.mode) else {
+            return;
+        };
+        let cur = self.scroll_top(v.content, v.viewport);
+        let max = v.content.saturating_sub(v.viewport);
+        let top = f(cur, max, v.viewport).min(max);
+        self.scroll = Scroll {
+            mode: self.mode,
+            selected: self.selected,
+            top,
+        };
+    }
+
+    pub fn scroll_lines(&mut self, delta: i32) {
+        self.move_scroll(|cur, _, _| (cur as i64 + delta as i64).max(0) as usize);
+    }
+
+    /// `dir` is 1 (down) or -1 (up); a page is the viewport minus one row.
+    pub fn scroll_page(&mut self, dir: i32) {
+        self.move_scroll(|cur, _, vh| {
+            let page = vh.saturating_sub(1).max(1) as i64;
+            (cur as i64 + dir as i64 * page).max(0) as usize
+        });
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.move_scroll(|_, _, _| 0);
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.move_scroll(|_, max, _| max);
     }
 
     pub fn toggle_informational(&mut self) {
@@ -178,7 +298,7 @@ impl App {
         self.status.clear();
         // The list changed: leave any detail/rule/raw/help view (Help included,
         // so the user is never stranded in Help after a list change).
-        self.mode = Mode::List;
+        self.set_mode(Mode::List);
         self.normalize();
     }
 
@@ -192,7 +312,7 @@ impl App {
         self.category = cats[(pos + delta).rem_euclid(n) as usize].0.clone();
         self.status.clear();
         self.selected = 0;
-        self.mode = Mode::List;
+        self.set_mode(Mode::List);
         self.normalize();
     }
 
@@ -240,14 +360,14 @@ impl App {
         self.status = error;
         self.range = r;
         self.selected = 0;
-        self.mode = Mode::List;
+        self.set_mode(Mode::List);
         self.normalize();
     }
 
     pub fn refresh(&mut self) {
         let r = self.range;
         self.fetch(r);
-        self.mode = Mode::List;
+        self.set_mode(Mode::List);
         self.normalize();
     }
 

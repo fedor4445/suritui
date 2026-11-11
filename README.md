@@ -181,6 +181,14 @@ rule's created and updated dates; missing fields show `-`.
 | `r` | rule text |
 | `w` | raw JSON |
 | `Esc` | back to the list |
+| `j` `k`, Down Up | scroll one line |
+| PageUp / PageDown | scroll about one page |
+| `g` / Home, `G` / End | jump to the top / bottom |
+
+The detail and raw JSON screens scroll with the keys above (long lines are
+wrapped). When the text does not fit, the bottom line shows the visible range,
+for example `lines 5-22 of 41`. The position goes back to the top whenever you
+change screen.
 
 **Rule** (`r` from the detail): the full rule looked up by SID in the local
 copy of ET Open. Limits you should know: it is the copy on the machine running
@@ -216,8 +224,8 @@ refreshing returns you to the list.
 
 ## Known limitations
 
-- The detail, rule, raw and help screens do not scroll: text longer than the
-  terminal is cut off.
+- The rule and help screens do not scroll: text longer than the terminal is
+  cut off. Only the detail and raw JSON screens scroll.
 - Text width is counted in characters, not display cells, so wide (CJK, emoji)
   characters can misalign columns.
 - ssh runs with `ConnectTimeout=10`, `ServerAliveInterval=10` and

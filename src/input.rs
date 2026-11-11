@@ -33,17 +33,25 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (Mode::List, KeyCode::PageDown) => app.move_selection(20),
         (Mode::List, KeyCode::Enter) => {
             if app.selected().is_some() {
-                app.mode = Mode::Detail;
+                app.set_mode(Mode::Detail);
             }
         }
         (Mode::List, KeyCode::Char('i')) => app.toggle_informational(),
         (Mode::List, KeyCode::Char('[')) => app.change_day(1),
         (Mode::List, KeyCode::Char(']')) => app.change_day(-1),
         (Mode::List, KeyCode::Char('R')) => app.refresh(),
-        (Mode::List, KeyCode::Char('?')) => app.mode = Mode::Help,
-        (Mode::Detail, KeyCode::Char('r')) => app.mode = Mode::Rule,
-        (Mode::Detail, KeyCode::Char('w')) => app.mode = Mode::Raw,
-        (Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help, KeyCode::Esc) => app.mode = Mode::List,
+        (Mode::List, KeyCode::Char('?')) => app.set_mode(Mode::Help),
+        (m, KeyCode::Char('j') | KeyCode::Down) if m.scrolls() => app.scroll_lines(1),
+        (m, KeyCode::Char('k') | KeyCode::Up) if m.scrolls() => app.scroll_lines(-1),
+        (m, KeyCode::PageDown) if m.scrolls() => app.scroll_page(1),
+        (m, KeyCode::PageUp) if m.scrolls() => app.scroll_page(-1),
+        (m, KeyCode::Char('g') | KeyCode::Home) if m.scrolls() => app.scroll_to_top(),
+        (m, KeyCode::Char('G') | KeyCode::End) if m.scrolls() => app.scroll_to_bottom(),
+        (Mode::Detail, KeyCode::Char('r')) => app.set_mode(Mode::Rule),
+        (Mode::Detail, KeyCode::Char('w')) => app.set_mode(Mode::Raw),
+        (Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help, KeyCode::Esc) => {
+            app.set_mode(Mode::List)
+        }
         _ => {}
     }
     false
