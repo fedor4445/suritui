@@ -2,6 +2,8 @@
 name = "suritui"
 version = "0.1.0"
 edition = "2021"
+license = "BSD-2-Clause"
+description = "A read-only terminal UI for browsing Suricata alerts over a restricted ssh account"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
