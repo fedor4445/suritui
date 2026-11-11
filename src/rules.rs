@@ -1,7 +1,9 @@
 //! Local rule index: maps a sid to its rule text and rev. Read-only.
 
+use crate::config::Config;
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +17,8 @@ pub struct Rule {
 pub enum RulesError {
     NotInstalled,
     Io(String),
+    Download(String),
+    Archive(String),
 }
 
 impl fmt::Display for RulesError {
@@ -22,6 +26,8 @@ impl fmt::Display for RulesError {
         match self {
             RulesError::NotInstalled => write!(f, "rules are not installed"),
             RulesError::Io(e) => write!(f, "rules I/O error: {e}"),
+            RulesError::Download(e) => write!(f, "rules download failed: {e}"),
+            RulesError::Archive(e) => write!(f, "rules archive rejected: {e}"),
         }
     }
 }
@@ -135,6 +141,144 @@ impl RuleIndex {
 pub fn rev_warning(alert_rev: Option<u32>, rule: &Rule) -> Option<String> {
     let a = alert_rev?;
     (a != rule.rev).then(|| format!("rule text is rev {}, alert was rev {a}", rule.rev))
+}
+
+/// Cap on the decompressed tar stream of the rules tarball (512 MB).
+pub const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Cap on the compressed download (128 MB; the real tarball is a few MB).
+const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+
+pub fn rules_url(et_version: &str) -> String {
+    format!("https://rules.emergingthreats.net/open/suricata-{et_version}/emerging.rules.tar.gz")
+}
+
+fn io_err(e: impl fmt::Display) -> RulesError {
+    RulesError::Io(e.to_string())
+}
+
+/// Unpack `.rules` files from a gzip tarball and replace `dir` with them.
+/// Returns the number of rules files installed. Nothing is touched unless the
+/// whole archive reads cleanly and holds at least one `.rules` file.
+pub fn install_from_tarball<R: Read>(r: R, dir: &Path) -> Result<usize, RulesError> {
+    install_with_cap(r, dir, MAX_UNPACKED_BYTES)
+}
+
+fn install_with_cap<R: Read>(r: R, dir: &Path, cap: u64) -> Result<usize, RulesError> {
+    let name = dir
+        .file_name()
+        .ok_or_else(|| RulesError::Io("rules directory has no name".into()))?
+        .to_string_lossy()
+        .into_owned();
+    let parent = match dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&parent).map_err(io_err)?;
+    let pid = std::process::id();
+    let tmp = parent.join(format!(".{name}.new-{pid}"));
+    let old = parent.join(format!(".{name}.old-{pid}"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&old);
+    std::fs::create_dir(&tmp).map_err(io_err)?;
+    let result = unpack_into(r, &tmp, cap).and_then(|n| swap_dirs(&tmp, dir, &old).map(|()| n));
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    result
+}
+
+/// Read the whole archive; write only regular `*.rules` entries, by file name.
+fn unpack_into<R: Read>(r: R, tmp: &Path, cap: u64) -> Result<usize, RulesError> {
+    let gz = flate2::read::GzDecoder::new(r);
+    // Everything read from the decompressor counts against the cap, including
+    // entries we skip and trailing bytes, so a decompression bomb is bounded.
+    let mut budget = gz.take(cap.saturating_add(1));
+    let mut written: u64 = 0;
+    let mut files = std::collections::HashSet::new();
+    {
+        let mut archive = tar::Archive::new(&mut budget);
+        for entry in archive
+            .entries()
+            .map_err(|e| RulesError::Archive(e.to_string()))?
+        {
+            let mut entry = entry.map_err(|e| RulesError::Archive(e.to_string()))?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let path = entry
+                .path()
+                .map_err(|e| RulesError::Archive(e.to_string()))?
+                .into_owned();
+            let Some(fname) = path.file_name().and_then(|f| f.to_str()) else {
+                continue;
+            };
+            if !fname.ends_with(".rules") || fname == ".rules" {
+                continue;
+            }
+            let mut out = std::fs::File::create(tmp.join(fname)).map_err(io_err)?;
+            written += std::io::copy(&mut entry, &mut out)
+                .map_err(|e| RulesError::Archive(e.to_string()))?;
+            if written > cap {
+                return Err(RulesError::Archive(format!(
+                    "unpacked size exceeds {cap} bytes"
+                )));
+            }
+            files.insert(fname.to_string());
+        }
+    }
+    // Drain to the end of the gzip stream so truncation or a bad checksum is
+    // detected even when the tar end marker came early.
+    std::io::copy(&mut budget, &mut std::io::sink())
+        .map_err(|e| RulesError::Archive(e.to_string()))?;
+    if budget.limit() == 0 {
+        return Err(RulesError::Archive(format!(
+            "unpacked size exceeds {cap} bytes"
+        )));
+    }
+    if files.is_empty() {
+        return Err(RulesError::Archive("no .rules files in archive".into()));
+    }
+    Ok(files.len())
+}
+
+/// Put `new` in place of `dir`, keeping the old directory until the move worked.
+fn swap_dirs(new: &Path, dir: &Path, old: &Path) -> Result<(), RulesError> {
+    let had_old = dir.exists();
+    if had_old {
+        std::fs::rename(dir, old).map_err(io_err)?;
+    }
+    if let Err(e) = std::fs::rename(new, dir) {
+        if had_old {
+            let _ = std::fs::rename(old, dir);
+        }
+        return Err(io_err(e));
+    }
+    if had_old {
+        let _ = std::fs::remove_dir_all(old);
+    }
+    Ok(())
+}
+
+/// Download the ET Open rules tarball and install it into `cfg.rules_dir`.
+pub fn update_rules(cfg: &Config, url_override: Option<&str>) -> Result<usize, RulesError> {
+    let url = url_override
+        .map(str::to_string)
+        .unwrap_or_else(|| rules_url(&cfg.et_version));
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(300)))
+        .build()
+        .into();
+    let resp = agent
+        .get(&url)
+        .call()
+        .map_err(|e| RulesError::Download(e.to_string()))?;
+    let reader = resp
+        .into_body()
+        .into_with_config()
+        .limit(MAX_DOWNLOAD_BYTES)
+        .reader();
+    install_from_tarball(reader, &cfg.rules_dir)
 }
 
 #[cfg(test)]
@@ -263,5 +407,207 @@ mod tests {
             Some("rule text is rev 3, alert was rev 2")
         );
         assert_eq!(rev_warning(None, &rule), None);
+    }
+
+    // ---- update-rules ----
+
+    fn raw_entry(
+        b: &mut tar::Builder<Vec<u8>>,
+        name: &str,
+        kind: tar::EntryType,
+        data: &[u8],
+        link: Option<&str>,
+    ) {
+        let mut h = tar::Header::new_gnu();
+        h.as_mut_bytes()[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_entry_type(kind);
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        if let Some(l) = link {
+            h.set_link_name(l).unwrap();
+        }
+        h.set_cksum();
+        b.append(&h, data).unwrap();
+    }
+
+    fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (n, d) in entries {
+            raw_entry(&mut b, n, tar::EntryType::Regular, d, None);
+        }
+        let raw = b.into_inner().unwrap();
+        gz(&raw)
+    }
+
+    fn gz(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        e.write_all(raw).unwrap();
+        e.finish().unwrap()
+    }
+
+    const RULE_A: &[u8] = b"alert dns any any -> any any (msg:\"a\"; sid:9000001; rev:1;)\n";
+    const RULE_B: &[u8] = b"alert dns any any -> any any (msg:\"b\"; sid:9000002; rev:1;)\n";
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn url_uses_version() {
+        assert_eq!(
+            rules_url("8.0.0"),
+            "https://rules.emergingthreats.net/open/suricata-8.0.0/emerging.rules.tar.gz"
+        );
+        assert!(rules_url("7.0.3").contains("suricata-7.0.3/"));
+    }
+
+    #[test]
+    fn installs_only_rules_files() {
+        let t = TempDir::new("inst");
+        let dir = t.0.join("rules");
+        let tgz = tarball(&[
+            ("rules/a.rules", RULE_A),
+            ("rules/b.rules", RULE_B),
+            ("rules/classification.config", b"config"),
+        ]);
+        assert_eq!(install_from_tarball(&tgz[..], &dir).unwrap(), 2);
+        assert_eq!(names(&dir), ["a.rules", "b.rules"]);
+        assert_eq!(names(&t.0), ["rules"], "no temp leftovers");
+        assert!(RuleIndex::from_dir(&dir).unwrap().lookup(9000002).is_some());
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        let t = TempDir::new("trav");
+        let dir = t.0.join("data/rules");
+        let tgz = tarball(&[
+            ("../evil.rules", RULE_A),
+            ("../../evil2.rules", RULE_A),
+            ("/abs.rules", RULE_A),
+            ("good.rules", RULE_B),
+        ]);
+        let n = install_from_tarball(&tgz[..], &dir);
+        assert!(!t.0.join("evil.rules").exists());
+        assert!(!t.0.join("data/evil.rules").exists());
+        assert!(!t.0.join("evil2.rules").exists());
+        assert!(!Path::new("/abs.rules").exists());
+        // Entries are flattened to their file name inside dir.
+        assert!(n.is_ok());
+        assert!(names(&dir).iter().all(|n| n.ends_with(".rules")));
+        assert_eq!(names(&t.0), ["data"]);
+        assert_eq!(names(&t.0.join("data")), ["rules"]);
+    }
+
+    #[test]
+    fn failed_install_keeps_existing_rules() {
+        let t = TempDir::new("fail");
+        let dir = t.0.join("rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.rules"), RULE_A).unwrap();
+        assert!(install_from_tarball(&b"this is not gzip at all"[..], &dir).is_err());
+        assert_eq!(names(&dir), ["old.rules"]);
+        assert_eq!(names(&t.0), ["rules"], "temp dir cleaned up");
+    }
+
+    #[test]
+    fn truncated_download_keeps_existing_rules() {
+        let t = TempDir::new("trunc");
+        let dir = t.0.join("rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.rules"), RULE_A).unwrap();
+        let tgz = tarball(&[("rules/a.rules", RULE_B)]);
+        let cut = &tgz[..tgz.len() - 6];
+        assert!(install_from_tarball(cut, &dir).is_err());
+        assert_eq!(names(&dir), ["old.rules"]);
+        assert_eq!(names(&t.0), ["rules"]);
+    }
+
+    #[test]
+    fn success_replaces_old_set() {
+        let t = TempDir::new("swap");
+        let dir = t.0.join("rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.rules"), RULE_A).unwrap();
+        let tgz = tarball(&[("rules/new.rules", RULE_B)]);
+        assert_eq!(install_from_tarball(&tgz[..], &dir).unwrap(), 1);
+        assert_eq!(names(&dir), ["new.rules"]);
+        assert_eq!(names(&t.0), ["rules"]);
+    }
+
+    #[test]
+    fn zero_rules_is_an_error_and_keeps_existing() {
+        let t = TempDir::new("zero");
+        let dir = t.0.join("rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.rules"), RULE_A).unwrap();
+        let tgz = tarball(&[("rules/classification.config", b"x")]);
+        assert!(install_from_tarball(&tgz[..], &dir).is_err());
+        assert_eq!(names(&dir), ["old.rules"]);
+        assert_eq!(names(&t.0), ["rules"]);
+    }
+
+    #[test]
+    fn links_and_dirs_are_never_followed() {
+        let t = TempDir::new("links");
+        let dir = t.0.join("rules");
+        let mut b = tar::Builder::new(Vec::new());
+        raw_entry(
+            &mut b,
+            "sym.rules",
+            tar::EntryType::Symlink,
+            b"",
+            Some("/etc/passwd"),
+        );
+        raw_entry(
+            &mut b,
+            "hard.rules",
+            tar::EntryType::Link,
+            b"",
+            Some("x.rules"),
+        );
+        raw_entry(&mut b, "adir.rules", tar::EntryType::Directory, b"", None);
+        raw_entry(&mut b, "ok.rules", tar::EntryType::Regular, RULE_A, None);
+        let tgz = gz(&b.into_inner().unwrap());
+        assert_eq!(install_from_tarball(&tgz[..], &dir).unwrap(), 1);
+        assert_eq!(names(&dir), ["ok.rules"]);
+    }
+
+    #[test]
+    fn oversized_archive_is_refused_and_keeps_existing() {
+        let t = TempDir::new("cap");
+        let dir = t.0.join("rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.rules"), RULE_A).unwrap();
+        let big = vec![b'x'; 5000];
+        let tgz = tarball(&[("a.rules", &big), ("b.rules", &big)]);
+        assert!(install_with_cap(&tgz[..], &dir, 8000).is_err());
+        assert_eq!(names(&dir), ["old.rules"]);
+        assert_eq!(names(&t.0), ["rules"]);
+        assert_eq!(install_with_cap(&tgz[..], &dir, 20_000).unwrap(), 2);
+    }
+
+    #[test]
+    fn update_rules_reports_download_failure_and_keeps_rules() {
+        let t = TempDir::new("net");
+        let dir = t.0.join("rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.rules"), RULE_A).unwrap();
+        let cfg = Config {
+            router: "192.0.2.1".into(),
+            user: "u".into(),
+            labels: Default::default(),
+            rules_dir: dir.clone(),
+            et_version: "8.0.0".into(),
+        };
+        // Port 1 on loopback: nothing listens there, no network is touched.
+        let e = update_rules(&cfg, Some("http://127.0.0.1:1/x.tar.gz")).unwrap_err();
+        assert!(matches!(e, RulesError::Download(_)), "{e}");
+        assert_eq!(names(&dir), ["old.rules"]);
     }
 }
