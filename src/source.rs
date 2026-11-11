@@ -4,7 +4,9 @@ use crate::alert::{parse_line, Alert};
 use crate::config::Config;
 use std::process::Command;
 
-/// Which day of alerts to load. Day(k) is k days back, 1..=13.
+const MAX_DAY: u8 = 13;
+
+/// Which day of alerts to load. Day(k) is k days back, 0..=13 (see `Range::day`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Range {
     Today,
@@ -14,7 +16,7 @@ pub enum Range {
 impl Range {
     /// `Day(k)` for k in 0..=13 (k = 0 is `day 0`); None above 13.
     pub fn day(k: u8) -> Option<Range> {
-        if k <= 13 {
+        if k <= MAX_DAY {
             Some(Range::Day(k))
         } else {
             None
@@ -24,7 +26,8 @@ impl Range {
     pub fn remote_args(&self) -> Vec<String> {
         match self {
             Range::Today => vec!["live".to_string()],
-            Range::Day(k) => vec!["day".to_string(), k.to_string()],
+            // Never emit a day above MAX_DAY, even if the pub variant was built directly.
+            Range::Day(k) => vec!["day".to_string(), (*k).min(MAX_DAY).to_string()],
         }
     }
 }
@@ -86,6 +89,14 @@ pub fn map_output(
     }
 }
 
+/// Reject out-of-range days before any ssh process is started.
+pub fn validate(r: Range) -> Result<Range, SourceError> {
+    match r {
+        Range::Day(k) if k > MAX_DAY => Err(SourceError::NoSuchDay),
+        ok => Ok(ok),
+    }
+}
+
 pub struct SshSource {
     target: String,
 }
@@ -115,6 +126,7 @@ impl SshSource {
 
 impl AlertSource for SshSource {
     fn load(&self, r: Range) -> Result<Loaded, SourceError> {
+        let r = validate(r)?;
         let out = Command::new("ssh")
             .args(self.ssh_args(r))
             .output()
@@ -152,6 +164,27 @@ mod tests {
     fn day_above_13_rejected() {
         assert_eq!(Range::day(14), None);
         assert_eq!(Range::day(255), None);
+    }
+
+    #[test]
+    fn validate_rejects_day_above_13_before_ssh() {
+        assert_eq!(validate(Range::Day(14)), Err(SourceError::NoSuchDay));
+        assert_eq!(validate(Range::Day(200)), Err(SourceError::NoSuchDay));
+        assert_eq!(validate(Range::Day(13)), Ok(Range::Day(13)));
+        assert_eq!(validate(Range::Day(0)), Ok(Range::Day(0)));
+        assert_eq!(validate(Range::Today), Ok(Range::Today));
+        // load() calls validate first, so this returns without spawning ssh.
+        let s = SshSource::new(&cfg());
+        assert_eq!(s.load(Range::Day(200)).unwrap_err(), SourceError::NoSuchDay);
+    }
+
+    #[test]
+    fn remote_args_never_above_13() {
+        for k in 0..=255u8 {
+            let a = Range::Day(k).remote_args();
+            assert!(a[1].parse::<u8>().unwrap() <= 13);
+            assert!(SshSource::new(&cfg()).ssh_args(Range::Day(k)).last().unwrap().parse::<u8>().unwrap() <= 13);
+        }
     }
 
     #[test]
