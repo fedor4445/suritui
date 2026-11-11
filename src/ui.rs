@@ -6,7 +6,7 @@ use crate::source::Range;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 const SIDEBAR_MAX: u16 = 26;
@@ -72,7 +72,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Detail => draw_detail(f, app, body),
         Mode::Rule => draw_rule(f, app, body),
         Mode::Raw => draw_raw(f, app, body),
-        Mode::Help => draw_help(f, body),
+        Mode::Help => draw_help(f, app, body),
     }
     let hint = match app.mode {
         Mode::List => "  ? help",
@@ -115,15 +115,22 @@ fn scroll_indicator(app: &App) -> Option<String> {
 fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     // Keep the last column blank as a gap before the list.
     let w = (area.width as usize).saturating_sub(1);
-    let mut lines = vec![Line::from(Span::styled(
-        fit("Categories", w),
-        header_style(),
-    ))];
-    for (label, n) in app.categories() {
+    let head = Line::from(Span::styled(fit("Categories", w), header_style()));
+    let cats = app.categories();
+    let h = (area.height as usize).saturating_sub(1);
+    // The header stays pinned; the category rows scroll so the current one
+    // is always visible.
+    let sel = cats
+        .iter()
+        .position(|(label, _)| *label == app.category())
+        .unwrap_or(0);
+    let offset = if h == 0 || sel < h { 0 } else { sel + 1 - h };
+    let mut lines = vec![head];
+    for (label, n) in cats.iter().skip(offset).take(h) {
         let count = n.to_string();
         let lw = w.saturating_sub(count.chars().count() + 1);
-        let text = format!("{} {}", fit(&label, lw), count);
-        let style = if label == app.category() {
+        let text = format!("{} {}", fit(label, lw), count);
+        let style = if *label == app.category() {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
             Style::default()
@@ -225,14 +232,6 @@ fn field_styled(name: &str, value: &str, style: Style) -> Line<'static> {
         ),
         Span::styled(clean(value), style),
     ])
-}
-
-fn screen(f: &mut Frame, area: Rect, title: &str, mut lines: Vec<Line<'static>>) {
-    lines.insert(
-        0,
-        Line::from(Span::styled(title.to_string(), header_style())),
-    );
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 /// Hard-wrap a line at `w` characters (the program counts characters, not
@@ -364,7 +363,7 @@ fn draw_rule(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::default());
     lines.push(Line::from(RULE_NOTE_1));
     lines.push(Line::from(RULE_NOTE_2));
-    screen(f, area, "Rule", lines);
+    scroll_screen(f, app, area, "Rule", lines);
 }
 
 fn draw_raw(f: &mut Frame, app: &App, area: Rect) {
@@ -381,13 +380,13 @@ fn draw_raw(f: &mut Frame, app: &App, area: Rect) {
     scroll_screen(f, app, area, "Raw JSON", lines);
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
+fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let keys = [
         ("Tab / Shift-Tab", "next / previous category"),
         ("j k, Down Up", "move in the list"),
         ("g G, Home End", "first / last row"),
         ("PgUp PgDn", "move 20 rows"),
-        ("j k, PgUp PgDn, g G", "scroll (detail and raw)"),
+        ("j k, PgUp PgDn, g G", "scroll (detail, rule, raw, help)"),
         ("Enter", "alert detail"),
         ("Esc", "back to the list"),
         ("i", "show / hide informational alerts"),
@@ -402,7 +401,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         .iter()
         .map(|(k, d)| field_wide(k, d))
         .collect::<Vec<_>>();
-    screen(f, area, "Help", lines);
+    scroll_screen(f, app, area, "Help", lines);
 }
 
 fn field_wide(k: &str, d: &str) -> Line<'static> {
@@ -1095,21 +1094,43 @@ mod tests {
     }
 
     #[test]
-    fn rule_and_help_do_not_scroll() {
+    fn rule_and_help_scroll_and_clamp() {
         for m in [Mode::Rule, Mode::Help] {
             let mut a = mode_app(m);
-            let before = render(&a, 60, 6);
-            for c in [
-                KeyCode::Char('j'),
-                KeyCode::Char('G'),
-                KeyCode::PageDown,
-                KeyCode::Down,
-            ] {
-                press(&mut a, c);
-                assert_eq!(a.mode, m);
-                assert_eq!(render(&a, 60, 6), before);
-            }
+            let top = first_line(&a, 30, 6);
+            assert!(footer(&a, 30, 6).contains("lines 1-4 of"), "{m:?}");
+            key(&mut a, 'j');
+            assert_ne!(first_line(&a, 30, 6), top, "{m:?}");
+            key(&mut a, 'G');
+            let end = footer(&a, 30, 6);
+            press(&mut a, KeyCode::PageDown);
+            assert_eq!(footer(&a, 30, 6), end, "{m:?} clamps at the end");
+            key(&mut a, 'g');
+            assert_eq!(first_line(&a, 30, 6), top, "{m:?}");
+            assert_eq!(a.mode, m);
         }
+    }
+
+    #[test]
+    fn sidebar_keeps_the_current_category_visible() {
+        let als: Vec<_> = (0..12)
+            .map(|i| {
+                alert(
+                    "2026-11-10T10:11:12.000000+0000",
+                    &format!("ET CAT{i:02} Probe"),
+                    "allowed",
+                    None,
+                )
+            })
+            .collect();
+        let mut a = app(als);
+        for _ in 0..8 {
+            press(&mut a, KeyCode::Tab);
+        }
+        let sel = a.category().to_string();
+        let r = render(&a, 90, 6);
+        assert!(r.iter().any(|l| l.contains(&sel)), "{sel} not visible");
+        assert!(r[0].contains("Categories"));
     }
 
     #[test]
@@ -1155,6 +1176,6 @@ mod tests {
     fn help_mentions_scroll_keys() {
         let mut a = sample();
         a.mode = Mode::Help;
-        assert!(screen(&a, 100, 24).contains("scroll (detail and raw)"));
+        assert!(screen(&a, 100, 24).contains("scroll (detail, rule, raw, help)"));
     }
 }

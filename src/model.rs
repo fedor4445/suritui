@@ -20,10 +20,9 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Screens that scroll. Adding `Mode::Rule` here (and drawing it with
-    /// `scroll_screen` in ui.rs) is all it takes to scroll the rule screen.
+    /// Screens that scroll (all drawn with `scroll_screen` in ui.rs).
     pub fn scrolls(self) -> bool {
-        matches!(self, Mode::Detail | Mode::Raw)
+        matches!(self, Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help)
     }
 }
 
