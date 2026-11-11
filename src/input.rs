@@ -27,6 +27,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (Mode::List, KeyCode::BackTab) => app.prev_category(),
         (Mode::List, KeyCode::Char('j') | KeyCode::Down) => app.move_selection(1),
         (Mode::List, KeyCode::Char('k') | KeyCode::Up) => app.move_selection(-1),
+        (Mode::List, KeyCode::Char('g') | KeyCode::Home) => app.move_selection(i32::MIN),
+        (Mode::List, KeyCode::Char('G') | KeyCode::End) => app.move_selection(i32::MAX),
+        (Mode::List, KeyCode::PageUp) => app.move_selection(-20),
+        (Mode::List, KeyCode::PageDown) => app.move_selection(20),
         (Mode::List, KeyCode::Enter) => {
             if app.selected().is_some() {
                 app.mode = Mode::Detail;
@@ -181,6 +185,62 @@ mod tests {
         assert_eq!(a.mode, Mode::Raw);
         handle_key(&mut a, k(KeyCode::Esc));
         assert_eq!(a.mode, Mode::List);
+    }
+
+    fn many(n: usize) -> App {
+        app((0..n)
+            .map(|i| {
+                alert(
+                    &format!("2026-11-10T10:{:02}:00.000000+0000", 59 - (i % 60)),
+                    &format!("ET SCAN r{i}"),
+                    "allowed",
+                    None,
+                )
+            })
+            .collect())
+    }
+
+    #[test]
+    fn paging_keys_jump_in_list() {
+        let mut a = many(50);
+        handle_key(&mut a, ch('G'));
+        assert_eq!(a.selected_index(), 49);
+        handle_key(&mut a, ch('g'));
+        assert_eq!(a.selected_index(), 0);
+        handle_key(&mut a, k(KeyCode::End));
+        assert_eq!(a.selected_index(), 49);
+        handle_key(&mut a, k(KeyCode::Home));
+        assert_eq!(a.selected_index(), 0);
+        handle_key(&mut a, k(KeyCode::PageDown));
+        assert_eq!(a.selected_index(), 20);
+        handle_key(&mut a, k(KeyCode::PageDown));
+        handle_key(&mut a, k(KeyCode::PageDown));
+        assert_eq!(a.selected_index(), 49);
+        handle_key(&mut a, k(KeyCode::PageUp));
+        assert_eq!(a.selected_index(), 29);
+        handle_key(&mut a, k(KeyCode::PageUp));
+        handle_key(&mut a, k(KeyCode::PageUp));
+        assert_eq!(a.selected_index(), 0);
+    }
+
+    #[test]
+    fn paging_keys_on_empty_list_and_outside_list_do_nothing() {
+        let mut e = app(vec![]);
+        for key in [ch('g'), ch('G'), k(KeyCode::Home), k(KeyCode::End)] {
+            handle_key(&mut e, key);
+            assert_eq!(e.selected_index(), 0);
+        }
+        let mut a = many(50);
+        handle_key(&mut a, k(KeyCode::Enter));
+        for key in [
+            ch('G'),
+            k(KeyCode::End),
+            k(KeyCode::PageDown),
+            k(KeyCode::PageUp),
+        ] {
+            handle_key(&mut a, key);
+            assert_eq!(a.selected_index(), 0);
+        }
     }
 
     #[test]

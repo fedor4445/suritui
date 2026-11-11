@@ -18,6 +18,15 @@ pub struct Alert {
     pub confidence: Option<String>,
     pub mitre: Option<String>,
     pub context: Option<String>,
+    /// Suricata classtype (`alert.category`).
+    pub category: Option<String>,
+    pub attack_target: Option<String>,
+    pub affected_product: Option<String>,
+    /// MITRE tactic, kept apart from the technique in `mitre`.
+    pub mitre_tactic: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub app_proto: Option<String>,
     pub raw: String,
 }
 
@@ -99,6 +108,16 @@ pub fn parse_line(line: &str) -> Option<Alert> {
         confidence: meta(md, "confidence"),
         mitre,
         context,
+        category: get("category").and_then(Value::as_str).map(str::to_string),
+        attack_target: meta(md, "attack_target"),
+        affected_product: meta(md, "affected_product"),
+        mitre_tactic: meta(md, "mitre_tactic_name"),
+        created_at: meta(md, "created_at"),
+        updated_at: meta(md, "updated_at"),
+        app_proto: v
+            .get("app_proto")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         raw: line.to_string(),
     })
 }
@@ -126,7 +145,7 @@ pub fn is_informational(a: &Alert) -> bool {
 mod tests {
     use super::*;
 
-    const FULL: &str = r#"{"timestamp":"2026-01-02T03:04:05.000000-0500","in_iface":"eth0","event_type":"alert","src_ip":"192.0.2.10","src_port":5555,"dest_ip":"198.51.100.20","dest_port":53,"proto":"UDP","alert":{"action":"allowed","gid":1,"signature_id":9000001,"rev":2,"signature":"ET DNS Query for .cc TLD","category":"Potentially Bad Traffic","severity":2,"metadata":{"signature_severity":["Major"],"confidence":["High"],"mitre_technique_id":["T1219"],"mitre_technique_name":["Remote_Access_Software"]}},"dns":{"rrname":"example.cc"}}"#;
+    const FULL: &str = r#"{"timestamp":"2026-01-02T03:04:05.000000-0500","in_iface":"eth0","event_type":"alert","src_ip":"192.0.2.10","src_port":5555,"dest_ip":"198.51.100.20","dest_port":53,"proto":"UDP","alert":{"action":"allowed","gid":1,"signature_id":9000001,"rev":2,"signature":"ET DNS Query for .cc TLD","category":"Potentially Bad Traffic","severity":2,"metadata":{"signature_severity":["Major"],"confidence":["High"],"mitre_technique_id":["T1219"],"mitre_technique_name":["Remote_Access_Software"],"mitre_tactic_name":["Command_And_Control"],"attack_target":["Client_Endpoint"],"affected_product":["Windows_XP_Vista_7_8_10_Server_32_64_Bit"],"created_at":["2020_01_02"],"updated_at":["2021_03_04"]}},"app_proto":"dns","dns":{"rrname":"example.cc"}}"#;
 
     const BARE: &str = r#"{"timestamp":"2026-01-02T03:04:05.000000-0500","event_type":"alert","src_ip":"192.0.2.1","dest_ip":"203.0.113.2","alert":{"signature":"SURICATA Ethertype unknown"}}"#;
 
@@ -154,6 +173,16 @@ mod tests {
         assert_eq!(a.confidence.as_deref(), Some("High"));
         assert_eq!(a.mitre.as_deref(), Some("T1219 Remote_Access_Software"));
         assert_eq!(a.context.as_deref(), Some("example.cc"));
+        assert_eq!(a.category.as_deref(), Some("Potentially Bad Traffic"));
+        assert_eq!(a.attack_target.as_deref(), Some("Client_Endpoint"));
+        assert_eq!(
+            a.affected_product.as_deref(),
+            Some("Windows_XP_Vista_7_8_10_Server_32_64_Bit")
+        );
+        assert_eq!(a.mitre_tactic.as_deref(), Some("Command_And_Control"));
+        assert_eq!(a.created_at.as_deref(), Some("2020_01_02"));
+        assert_eq!(a.updated_at.as_deref(), Some("2021_03_04"));
+        assert_eq!(a.app_proto.as_deref(), Some("dns"));
         assert_eq!(a.raw, FULL);
     }
 
@@ -172,6 +201,13 @@ mod tests {
         assert_eq!(a.confidence, None);
         assert_eq!(a.mitre, None);
         assert_eq!(a.context, None);
+        assert_eq!(a.category, None);
+        assert_eq!(a.attack_target, None);
+        assert_eq!(a.affected_product, None);
+        assert_eq!(a.mitre_tactic, None);
+        assert_eq!(a.created_at, None);
+        assert_eq!(a.updated_at, None);
+        assert_eq!(a.app_proto, None);
     }
 
     #[test]

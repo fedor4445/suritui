@@ -24,6 +24,13 @@ pub fn alert(ts: &str, sig: &str, action: &str, et: Option<&str>) -> Alert {
         confidence: None,
         mitre: None,
         context: None,
+        category: None,
+        attack_target: None,
+        affected_product: None,
+        mitre_tactic: None,
+        created_at: None,
+        updated_at: None,
+        app_proto: None,
         raw: r#"{"event_type":"alert"}"#.to_string(),
     }
 }

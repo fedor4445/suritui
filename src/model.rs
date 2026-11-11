@@ -175,6 +175,7 @@ impl App {
 
     pub fn toggle_informational(&mut self) {
         self.hide_informational = !self.hide_informational;
+        self.status.clear();
         // The list changed: leave any detail/rule/raw/help view (Help included,
         // so the user is never stranded in Help after a list change).
         self.mode = Mode::List;
@@ -189,6 +190,7 @@ impl App {
             .unwrap_or(0) as isize;
         let n = cats.len() as isize;
         self.category = cats[(pos + delta).rem_euclid(n) as usize].0.clone();
+        self.status.clear();
         self.selected = 0;
         self.mode = Mode::List;
         self.normalize();
@@ -203,6 +205,7 @@ impl App {
     }
 
     pub fn move_selection(&mut self, delta: i32) {
+        self.status.clear();
         let len = self.visible().len();
         if len == 0 {
             self.selected = 0;
@@ -224,10 +227,17 @@ impl App {
             return;
         }
         // Today is live and never served from the cache; only Day(k) is cached.
+        let mut error = String::new();
         if (r == Range::Today || !self.cache.contains_key(&r)) && !self.fetch(r) {
-            return;
+            // A failed Today reload still lets the user return to the cached
+            // Today (if any); the error stays visible. Other days stay put.
+            if r == Range::Today && self.cache.contains_key(&r) {
+                error = std::mem::take(&mut self.status);
+            } else {
+                return;
+            }
         }
-        self.status.clear();
+        self.status = error;
         self.range = r;
         self.selected = 0;
         self.mode = Mode::List;
@@ -274,9 +284,6 @@ impl App {
     }
 
     pub fn status_line(&self) -> String {
-        if !self.status.is_empty() {
-            return self.status.clone();
-        }
         let shown = self.visible().len();
         let hidden = self.hidden_count();
         let mut s = if shown == 0 && hidden == 0 {
@@ -293,6 +300,10 @@ impl App {
         let skipped = self.cache.get(&self.range).map_or(0, |l| l.skipped);
         if skipped > 0 {
             s.push_str(&format!(", {skipped} lines skipped"));
+        }
+        if !self.status.is_empty() {
+            s.push_str(" | ");
+            s.push_str(&self.status);
         }
         s
     }
@@ -336,6 +347,13 @@ mod tests {
             confidence: None,
             mitre: None,
             context: None,
+            category: None,
+            attack_target: None,
+            affected_product: None,
+            mitre_tactic: None,
+            created_at: None,
+            updated_at: None,
+            app_proto: None,
             raw: "{}".to_string(),
         }
     }
@@ -553,14 +571,112 @@ mod tests {
         h.app.change_day(1);
         h.app.change_day(-1);
         assert_eq!(h.app.visible().len(), 1);
-        // failed reload keeps old data, stays on Day(0), shows error
+        // failed Today reload falls back to the cached Today and shows the error
         h.data
             .borrow_mut()
             .insert(Range::Today, Err(SourceError::Ssh("down".into())));
         h.app.change_day(1);
         h.app.change_day(-1);
+        assert_eq!(h.app.range, Range::Today);
+        assert_eq!(h.app.visible().len(), 1);
+        assert_eq!(h.app.status_line(), "1 shown | down");
+    }
+
+    #[test]
+    fn failed_today_reload_without_cache_stays_put() {
+        let mut h = harness(sample(), 0, None);
+        h.app.change_day(1);
+        h.app.cache.remove(&Range::Today);
+        h.data
+            .borrow_mut()
+            .insert(Range::Today, Err(SourceError::Ssh("down".into())));
+        h.app.change_day(-1);
         assert_eq!(h.app.range, Range::Day(0));
-        assert_eq!(h.app.status_line(), "down");
+        assert!(h.app.status_line().ends_with("| down"));
+    }
+
+    fn failing_today(h: &mut H) {
+        h.data
+            .borrow_mut()
+            .insert(Range::Today, Err(SourceError::Ssh("down".into())));
+        h.app.refresh();
+        assert!(h.app.status_line().ends_with(" | down"));
+    }
+
+    #[test]
+    fn status_line_keeps_counts_with_error() {
+        let mut h = harness(sample(), 3, None);
+        h.app.status = "boom".into();
+        assert_eq!(h.app.status_line(), "6 shown, 3 lines skipped | boom");
+        h.app.toggle_informational();
+        h.app.status = "boom".into();
+        assert_eq!(
+            h.app.status_line(),
+            "4 shown, 2 hidden (informational), 3 lines skipped | boom"
+        );
+        let mut e = harness(vec![], 0, None);
+        e.app.status = "boom".into();
+        assert_eq!(e.app.status_line(), "0 alerts in this range | boom");
+    }
+
+    #[test]
+    fn failed_refresh_sets_error_and_keeps_counts() {
+        let mut h = harness(sample(), 0, None);
+        failing_today(&mut h);
+        assert_eq!(h.app.status_line(), "6 shown | down");
+    }
+
+    #[test]
+    fn error_clears_on_toggle() {
+        let mut h = harness(sample(), 0, None);
+        failing_today(&mut h);
+        h.app.toggle_informational();
+        assert_eq!(h.app.status_line(), "4 shown, 2 hidden (informational)");
+    }
+
+    #[test]
+    fn error_clears_on_category_change() {
+        let mut h = harness(sample(), 0, None);
+        failing_today(&mut h);
+        h.app.next_category();
+        assert!(!h.app.status_line().contains('|'));
+        failing_today(&mut h);
+        h.app.prev_category();
+        assert!(!h.app.status_line().contains('|'));
+    }
+
+    #[test]
+    fn error_clears_on_selection_move() {
+        let mut h = harness(sample(), 0, None);
+        failing_today(&mut h);
+        h.app.move_selection(1);
+        assert_eq!(h.app.status_line(), "6 shown");
+    }
+
+    #[test]
+    fn error_clears_on_successful_day_change_and_refresh() {
+        let mut h = harness(sample(), 0, None);
+        failing_today(&mut h);
+        h.app.change_day(1);
+        assert_eq!(h.app.range, Range::Day(0));
+        assert!(!h.app.status_line().contains('|'));
+        h.data
+            .borrow_mut()
+            .insert(Range::Day(0), Err(SourceError::Ssh("x".into())));
+        h.app.refresh();
+        assert!(h.app.status_line().ends_with("| x"));
+        h.data.borrow_mut().insert(Range::Day(0), Ok(vec![]));
+        h.app.refresh();
+        assert_eq!(h.app.status_line(), "0 alerts in this range");
+    }
+
+    #[test]
+    fn move_selection_extremes_do_not_overflow() {
+        let mut h = harness(sample(), 0, None);
+        h.app.move_selection(i32::MAX);
+        assert_eq!(h.app.selected_index(), 5);
+        h.app.move_selection(i32::MIN);
+        assert_eq!(h.app.selected_index(), 0);
     }
 
     #[test]
@@ -638,7 +754,7 @@ mod tests {
             .insert(Range::Day(0), Err(SourceError::NoSuchDay));
         h.app.change_day(1);
         assert_eq!(h.app.range, Range::Today);
-        assert_eq!(h.app.status_line(), "no log for that day");
+        assert_eq!(h.app.status_line(), "6 shown | no log for that day");
         assert_eq!(h.app.visible().len(), 6);
     }
 
@@ -650,14 +766,14 @@ mod tests {
             Err(SourceError::Ssh("connection refused".into())),
         );
         h.app.refresh();
-        assert_eq!(h.app.status_line(), "connection refused");
+        assert_eq!(h.app.status_line(), "6 shown | connection refused");
         assert_eq!(h.app.visible().len(), 6);
         h.data
             .borrow_mut()
             .insert(Range::Day(0), Err(SourceError::Ssh("timed out".into())));
         h.app.change_day(1);
         assert_eq!(h.app.range, Range::Today);
-        assert_eq!(h.app.status_line(), "timed out");
+        assert_eq!(h.app.status_line(), "6 shown | timed out");
     }
 
     #[test]

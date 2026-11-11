@@ -141,7 +141,7 @@ fn row_line(app: &App, a: &Alert, width: usize, selected: bool) -> Line<'static>
         left -= cell.chars().count();
         spans.push(Span::styled(cell, style));
     };
-    let action_blocked = a.action != "allowed";
+    let action_blocked = a.action != "allowed" && a.action != "-";
     // Fixed columns first; the signature takes whatever is left, so it is
     // the first thing to shrink on narrow terminals.
     push(format!("{} ", fit(&time_of(&a.ts), 8)), base, &mut spans);
@@ -189,12 +189,16 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn field(name: &str, value: &str) -> Line<'static> {
+    field_styled(name, value, Style::default())
+}
+
+fn field_styled(name: &str, value: &str, style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("{name:<12}"),
+            format!("{name:<14}"),
             Style::default().add_modifier(Modifier::DIM),
         ),
-        Span::raw(clean(value)),
+        Span::styled(clean(value), style),
     ])
 }
 
@@ -221,7 +225,15 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         field("Source", &a.src),
         field("Destination", &a.dst),
         field("Protocol", &a.proto),
-        field("Action", &a.action),
+        field_styled(
+            "Action",
+            &a.action,
+            if a.action == "allowed" || a.action == "-" {
+                Style::default()
+            } else {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            },
+        ),
         field(
             "SID / rev",
             &format!(
@@ -234,7 +246,14 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         field("ET severity", &opt(a.et_severity.clone())),
         field("Confidence", &opt(a.confidence.clone())),
         field("MITRE", &opt(a.mitre.clone())),
+        field("MITRE tactic", &opt(a.mitre_tactic.clone())),
         field("Context", &opt(a.context.clone())),
+        field("Category", &opt(a.category.clone())),
+        field("Target", &opt(a.attack_target.clone())),
+        field("Product", &opt(a.affected_product.clone())),
+        field("App proto", &opt(a.app_proto.clone())),
+        field("Created", &opt(a.created_at.clone())),
+        field("Updated", &opt(a.updated_at.clone())),
     ];
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
@@ -289,6 +308,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let keys = [
         ("Tab / Shift-Tab", "next / previous category"),
         ("j k, Down Up", "move in the list"),
+        ("g G, Home End", "first / last row"),
+        ("PgUp PgDn", "move 20 rows"),
         ("Enter", "alert detail"),
         ("Esc", "back to the list"),
         ("i", "show / hide informational alerts"),
@@ -422,11 +443,163 @@ mod tests {
     fn detail_shows_key_fields_and_raw_hint() {
         let mut a = sample();
         a.mode = Mode::Detail;
-        let s = screen(&a, 100, 20);
+        let s = screen(&a, 100, 30);
         assert!(s.contains("ET SCAN Probe"));
         assert!(s.contains("2000001"));
         assert!(s.contains("192.0.2.1:1"));
         assert!(s.contains("w raw JSON"));
+    }
+
+    fn cells(app: &App, w: u16, h: u16) -> Vec<Vec<(String, Style)>> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| (buf[(x, y)].symbol().to_string(), buf[(x, y)].style()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Style of the first cell of `needle` on the row that contains `row_key`.
+    fn style_of(app: &App, row_key: &str, needle: &str) -> Style {
+        let grid = cells(app, 120, 30);
+        for row in grid {
+            let line: String = row.iter().map(|(c, _)| c.as_str()).collect();
+            if line.contains(row_key) {
+                let at = line.find(needle).expect(needle);
+                let col = line[..at].chars().count();
+                return row[col].1;
+            }
+        }
+        panic!("row {row_key} not found");
+    }
+
+    #[test]
+    fn detail_action_not_allowed_is_bold_red() {
+        let mut a = sample();
+        a.move_selection(1); // the "blocked" alert
+        a.mode = Mode::Detail;
+        let st = style_of(&a, "Action", "blocked");
+        assert_eq!(st.fg, Some(Color::Red));
+        assert!(st.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn detail_action_allowed_is_plain() {
+        let mut a = sample();
+        a.mode = Mode::Detail;
+        let st = style_of(&a, "Action", "allowed");
+        assert_ne!(st.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn detail_shows_extra_fields_when_present() {
+        let mut al = alert(
+            "2026-11-10T10:11:12.000000+0000",
+            "ET SCAN Probe",
+            "allowed",
+            None,
+        );
+        al.category = Some("Attempted Recon".into());
+        al.attack_target = Some("Server_Endpoint".into());
+        al.affected_product = Some("Linux".into());
+        al.mitre_tactic = Some("Discovery".into());
+        al.created_at = Some("2020_01_02".into());
+        al.updated_at = Some("2021_03_04".into());
+        al.app_proto = Some("http".into());
+        let mut a = app(vec![al]);
+        a.mode = Mode::Detail;
+        let rows = render(&a, 100, 30);
+        let has = |label: &str, val: &str| {
+            assert!(
+                rows.iter().any(|r| r.contains(label) && r.contains(val)),
+                "{label} {val}"
+            )
+        };
+        has("Category", "Attempted Recon");
+        has("Target", "Server_Endpoint");
+        has("Product", "Linux");
+        has("MITRE tactic", "Discovery");
+        has("Created", "2020_01_02");
+        has("Updated", "2021_03_04");
+        has("App proto", "http");
+    }
+
+    #[test]
+    fn detail_extra_fields_missing_show_dash() {
+        let mut a = sample();
+        a.mode = Mode::Detail;
+        let rows = render(&a, 100, 30);
+        for label in [
+            "Category",
+            "Target",
+            "Product",
+            "MITRE tactic",
+            "Created",
+            "Updated",
+            "App proto",
+        ] {
+            let r = rows.iter().find(|r| r.contains(label)).expect(label);
+            assert!(r.trim_end().ends_with(" -"), "{label}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn extra_detail_values_are_cleaned() {
+        let mut al = alert("2026-11-10T10:11:12.000000+0000", "ET X y", "allowed", None);
+        al.category = Some(format!("C{HOSTILE}"));
+        al.attack_target = Some(format!("T{HOSTILE}"));
+        al.affected_product = Some(format!("P{HOSTILE}"));
+        al.mitre_tactic = Some(format!("M{HOSTILE}"));
+        al.created_at = Some(format!("D{HOSTILE}"));
+        al.updated_at = Some(format!("U{HOSTILE}"));
+        al.app_proto = Some(format!("A{HOSTILE}"));
+        let mut a = app(vec![al]);
+        a.mode = Mode::Detail;
+        assert_clean(&screen(&a, 120, 30));
+    }
+
+    #[test]
+    fn missing_action_dash_is_not_red_in_list() {
+        let a = app(vec![alert(
+            "2026-11-10T10:11:12.000000+0000",
+            "ET DASH Row",
+            "-",
+            None,
+        )]);
+        let grid = cells(&a, 120, 10);
+        let row = grid
+            .iter()
+            .find(|r| {
+                r.iter()
+                    .map(|(c, _)| c.as_str())
+                    .collect::<String>()
+                    .contains("ET DASH Row")
+            })
+            .unwrap();
+        assert!(row.iter().all(|(_, st)| st.fg != Some(Color::Red)));
+        let text: String = row.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(!text.contains(" - "));
+    }
+
+    #[test]
+    fn status_line_shows_counts_and_error() {
+        let mut a = sample();
+        a.status = "ssh down".into();
+        let s = screen(&a, 120, 10);
+        assert!(s.contains("3 shown | ssh down"));
+    }
+
+    #[test]
+    fn help_lists_paging_keys() {
+        let mut a = sample();
+        a.mode = Mode::Help;
+        let s = screen(&a, 100, 24);
+        assert!(s.contains("g G, Home End"));
+        assert!(s.contains("PgUp PgDn"));
     }
 
     #[test]

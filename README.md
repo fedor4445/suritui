@@ -29,7 +29,8 @@ or of the rotated `eve.json.K.gz` (for `day K`) as raw JSON lines, and nothing
 else; exit 2 for any other command and 3 when the requested day does not exist.
 
 Create a dedicated account on the router for this, with a locked password, no
-sudo, and read access to the Suricata log only through a group. Then restrict
+sudo, and read access to the Suricata log only (for example through a dedicated
+group). Then restrict
 its key to the script in `authorized_keys`:
 
 ```
@@ -128,8 +129,11 @@ downloads over HTTPS only. The viewer never downloads anything itself. To keep
 the copy fresh, run it from cron:
 
 ```
-17 4 * * * /path/to/suritui update-rules
+17 4 * * * /path/to/suritui update-rules >/dev/null
 ```
+
+The `>/dev/null` drops the normal output; errors still go to stderr, so cron
+only sends mail when the update fails.
 
 ## Screens and keys
 
@@ -145,12 +149,16 @@ rest go to `Other`. Only categories that have alerts are listed. The list shows
 newest first: time, interface, source, destination, signature. The `action` is
 shown (in red) only when it is not `allowed`, so alerts a Suricata IPS blocked
 stand out. Critical and Major alerts are bold yellow; informational ones are
-dim. A status line at the bottom shows what is shown and what is hidden.
+dim. A status line at the bottom always shows what is shown and what is hidden; the
+last error, if any, is appended after a `|`. The error clears on the next
+action that changes the view or moves the selection, or on a successful reload.
 
 | Key | Action |
 |-----|--------|
 | `Tab` / `Shift-Tab` | next / previous category |
 | `j` `k`, Down Up | move in the list |
+| `g` / Home, `G` / End | first / last row |
+| PageUp / PageDown | move 20 rows up / down |
 | `Enter` | open the alert detail |
 | `i` | hide / show informational alerts |
 | `[` `]` | older / newer day (Today, Yesterday, back to 14 days ago) |
@@ -163,8 +171,10 @@ alert has none (decoder events), Suricata severity 3. By default everything is
 shown.
 
 **Detail** (`Enter`): signature, time, interface, source, destination,
-protocol, action, SID and rev, severities, confidence, MITRE fields and DNS/TLS/HTTP
-context where present; missing fields show `-`.
+protocol, action (bold red when it is not `allowed`), SID and rev, severities,
+confidence, MITRE technique and tactic, DNS/TLS/HTTP context, Suricata
+category (classtype), attack target, affected product, app protocol, and the
+rule's created and updated dates; missing fields show `-`.
 
 | Key | Action |
 |-----|--------|
@@ -190,7 +200,8 @@ refreshing returns you to the list.
 ## Security notes
 
 - ssh runs with `BatchMode=yes` (never prompts) and `StrictHostKeyChecking=yes`
-  (an unknown or changed host key is an error, never accepted automatically).
+  (an unknown or changed host key is an error, never accepted automatically;
+  a changed key is reported as such in the status line).
   The router's host key must already be in `known_hosts`.
 - Only the commands `live` and `day K` with K from 0 to 13 are ever sent; a
   larger day is rejected before ssh starts.
@@ -209,8 +220,9 @@ refreshing returns you to the list.
   terminal is cut off.
 - Text width is counted in characters, not display cells, so wide (CJK, emoji)
   characters can misalign columns.
-- There is no ssh connect timeout. If the router hangs, the screen freezes
-  until ssh gives up on its own.
+- ssh runs with `ConnectTimeout=10`, `ServerAliveInterval=10` and
+  `ServerAliveCountMax=3`, so an unreachable or hung router fails after about
+  10 to 40 seconds, but the screen is still blocked until then.
 - Data is limited to today plus the 14 rotated logs the router script serves;
   there is no combined multi-day view.
 - On narrow terminals the signature column shrinks first. The sidebar does not

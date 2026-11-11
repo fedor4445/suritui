@@ -83,9 +83,22 @@ pub fn map_output(
     match status_code {
         Some(0) => Ok(parse_output(&String::from_utf8_lossy(stdout))),
         Some(3) => Err(SourceError::NoSuchDay),
-        _ => Err(SourceError::Ssh(
-            String::from_utf8_lossy(stderr).trim_end().to_string(),
-        )),
+        code => Err(SourceError::Ssh(ssh_failure_text(code, stderr))),
+    }
+}
+
+/// One line of error text for a failed ssh run.
+fn ssh_failure_text(code: Option<i32>, stderr: &[u8]) -> String {
+    let err = String::from_utf8_lossy(stderr);
+    if err.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
+        return "router host key CHANGED, ssh refused; check known_hosts".to_string();
+    }
+    match err.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
+        Some(line) => line.to_string(),
+        None => match code {
+            Some(c) => format!("ssh failed (exit {c})"),
+            None => "ssh failed (killed by signal)".to_string(),
+        },
     }
 }
 
@@ -109,10 +122,21 @@ impl SshSource {
     }
 
     pub fn ssh_args(&self, r: Range) -> Vec<String> {
-        let mut args: Vec<String> = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let mut args: Vec<String> = [
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=10",
+            "-o",
+            "ServerAliveCountMax=3",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         args.push(self.target.clone());
         args.extend(r.remote_args());
         args
@@ -200,12 +224,18 @@ mod tests {
                 "BatchMode=yes",
                 "-o",
                 "StrictHostKeyChecking=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=10",
+                "-o",
+                "ServerAliveCountMax=3",
                 "alertview@198.51.100.1",
                 "live"
             ]
         );
         assert_eq!(
-            s.ssh_args(Range::Day(2))[4..],
+            s.ssh_args(Range::Day(2))[10..],
             ["alertview@198.51.100.1", "day", "2"]
         );
     }
@@ -242,6 +272,37 @@ mod tests {
             map_output(None, b"", b"killed"),
             Err(SourceError::Ssh(_))
         ));
+    }
+
+    #[test]
+    fn blank_stderr_failure_names_the_exit_code() {
+        let e = map_output(Some(255), b"", b"").unwrap_err();
+        assert_eq!(e, SourceError::Ssh("ssh failed (exit 255)".into()));
+        let e = map_output(Some(1), b"", b" \n\n").unwrap_err();
+        assert_eq!(e, SourceError::Ssh("ssh failed (exit 1)".into()));
+        let e = map_output(None, b"", b"").unwrap_err();
+        assert_eq!(e, SourceError::Ssh("ssh failed (killed by signal)".into()));
+    }
+
+    #[test]
+    fn host_key_change_is_reported_as_such() {
+        let stderr = b"@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n@@@@@@@@\nHost key verification failed.\n";
+        let e = map_output(Some(255), b"", stderr).unwrap_err();
+        assert_eq!(
+            e,
+            SourceError::Ssh("router host key CHANGED, ssh refused; check known_hosts".into())
+        );
+    }
+
+    #[test]
+    fn multi_line_stderr_uses_last_non_empty_line() {
+        let e = map_output(
+            Some(255),
+            b"",
+            b"Warning: something\nPermission denied (publickey).\n\n",
+        )
+        .unwrap_err();
+        assert_eq!(e, SourceError::Ssh("Permission denied (publickey).".into()));
     }
 
     #[test]
