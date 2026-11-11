@@ -20,8 +20,28 @@ fn header_style() -> Style {
 }
 
 /// Truncate to `w` chars (never splitting a char) and pad with spaces.
+/// Replace control characters (C0, DEL, C1) and bidi overrides/isolates with
+/// `?`. All text that did not originate in this program passes through here
+/// (via `fit`, `field`, `plain`) before it becomes a span.
+fn clean(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// A line of untrusted text.
+fn plain(s: &str) -> Line<'static> {
+    Line::from(clean(s))
+}
+
 fn fit(s: &str, w: usize) -> String {
-    let mut out: String = s.chars().take(w).collect();
+    let mut out: String = clean(s).chars().take(w).collect();
     let n = out.chars().count();
     out.extend(std::iter::repeat_n(' ', w - n));
     out
@@ -61,7 +81,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::raw(app.status_line()),
+            Span::raw(clean(&app.status_line())),
             Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),
         ])),
         status,
@@ -117,7 +137,7 @@ fn row_line(app: &App, a: &Alert, width: usize, selected: bool) -> Line<'static>
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut left = width;
     let mut push = |text: String, style: Style, spans: &mut Vec<Span<'static>>| {
-        let cell: String = text.chars().take(left).collect();
+        let cell: String = clean(&text).chars().take(left).collect();
         left -= cell.chars().count();
         spans.push(Span::styled(cell, style));
     };
@@ -174,7 +194,7 @@ fn field(name: &str, value: &str) -> Line<'static> {
             format!("{name:<12}"),
             Style::default().add_modifier(Modifier::DIM),
         ),
-        Span::raw(value.to_string()),
+        Span::raw(clean(value)),
     ])
 }
 
@@ -230,12 +250,12 @@ fn draw_rule(f: &mut Frame, app: &App, area: Rect) {
         RuleView::Found { text, warning } => {
             if let Some(w) = warning {
                 lines.push(Line::from(Span::styled(
-                    w,
+                    clean(&w),
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::default());
             }
-            lines.push(Line::from(text));
+            lines.push(plain(&text));
         }
         RuleView::NotInstalled => lines.push(Line::from(
             "The ET Open rules are not installed here. Run `suritui update-rules` to fetch them.",
@@ -261,7 +281,7 @@ fn draw_raw(f: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or_else(|| a.raw.clone())
         })
         .unwrap_or_default();
-    let lines = text.lines().map(|l| Line::from(l.to_string())).collect();
+    let lines = text.lines().map(plain).collect();
     screen(f, area, "Raw JSON", lines);
 }
 
@@ -369,9 +389,11 @@ mod tests {
     #[test]
     fn blocked_action_is_shown_allowed_is_not() {
         let a = sample();
-        let s = screen(&a, 120, 20);
-        assert!(s.contains("blocked"));
-        assert!(!s.contains("allowed"));
+        let rows = render(&a, 120, 20);
+        let row = |sig: &str| rows.iter().find(|r| r.contains(sig)).expect(sig).clone();
+        assert!(row("ET DNS Query").contains("blocked"));
+        assert!(!row("ET SCAN Probe").contains("allowed"));
+        assert!(!row("ET DNS Other").contains("allowed"));
     }
 
     #[test]
@@ -457,5 +479,57 @@ mod tests {
     fn status_line_always_visible() {
         let a = sample();
         assert!(screen(&a, 40, 6).contains("shown"));
+    }
+
+    const HOSTILE: &str = "\x1b[31m\x07\u{9b}\u{202e}";
+
+    fn assert_clean(s: &str) {
+        for c in ['\x1b', '\x07', '\u{9b}', '\u{202e}'] {
+            assert!(!s.contains(c), "leaked {:?}", c);
+        }
+        assert!(s.contains('?'));
+    }
+
+    fn hostile_app() -> App {
+        let mut al = alert(
+            "2026-11-10T10:11:12.000000+0000",
+            &format!("SIG{HOSTILE}end"),
+            "allowed",
+            None,
+        );
+        al.src = format!("S{HOSTILE}");
+        al.context = Some(format!("C{HOSTILE}"));
+        al.raw = format!("raw{HOSTILE}notjson");
+        app_with(
+            vec![(crate::source::Range::Today, vec![al])],
+            Some(crate::rules::RuleIndex::from_text(&format!(
+                "alert tcp any any -> any any (msg:\"x{HOSTILE}\"; sid:2000001; rev:5;)\n"
+            ))),
+        )
+    }
+
+    #[test]
+    fn hostile_text_never_reaches_list_detail_raw_rule() {
+        for m in [Mode::List, Mode::Detail, Mode::Raw, Mode::Rule] {
+            let mut a = hostile_app();
+            a.mode = m;
+            assert_clean(&screen(&a, 120, 24));
+        }
+    }
+
+    #[test]
+    fn hostile_status_is_cleaned() {
+        let mut a = sample();
+        a.status = format!("ssh: bad{HOSTILE}");
+        let out = screen(&a, 120, 10);
+        assert_clean(&out);
+        assert!(out.contains("bad?[31m"));
+    }
+
+    #[test]
+    fn normal_text_is_unchanged() {
+        let s = screen(&sample(), 120, 20);
+        assert!(s.contains("ET SCAN Probe") && !s.contains('?') || s.contains("? help"));
+        assert_eq!(clean("ET SCAN Probe é 日本"), "ET SCAN Probe é 日本");
     }
 }
