@@ -290,6 +290,26 @@ pub fn parse_sources(text: &str) -> Vec<Source> {
     out
 }
 
+/// The names in `suricata-update list-enabled-sources`: one `  - name` per line.
+pub fn parse_enabled(text: &str) -> Vec<String> {
+    strip_ansi(text)
+        .lines()
+        .filter(|l| l.starts_with(' '))
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// The enabled sources with their details from the index (a bare name if the
+/// index no longer has it).
+pub fn enabled_sources(names: Vec<String>, all: &[Source]) -> Vec<Source> {
+    names
+        .into_iter()
+        .map(|n| all.iter().find(|s| s.name == n).cloned().unwrap_or(Source { name: n, ..Default::default() }))
+        .collect()
+}
+
 /// Split the index into free and key-needing sources, minus the enabled ones.
 pub fn build_sources(enabled: Vec<Source>, all: Vec<Source>) -> SourcesView {
     let names: Vec<&str> = enabled.iter().map(|s| s.name.as_str()).collect();
@@ -319,7 +339,8 @@ pub fn sources_from_lines(lines: &[String]) -> SourcesView {
             ..Default::default()
         };
     };
-    build_sources(parse_sources(&lines[..at].join("\n")), parse_sources(&lines[at + 1..].join("\n")))
+    let all = parse_sources(&lines[at + 1..].join("\n"));
+    build_sources(enabled_sources(parse_enabled(&lines[..at].join("\n")), &all), all)
 }
 
 #[cfg(test)]
@@ -441,6 +462,17 @@ Name: abuse.ch/urlhaus
   Summary: URLhaus
   License: CC0-1.0
 ";
+
+    #[test]
+    fn enabled_sources_are_the_dash_lines() {
+        let t = "12/11/2026 -- 05:51:15 - <Info> -- Using x\n\x1b[1mEnabled sources:\x1b[0m\n  - oisf/trafficid\n  - et/open\n";
+        assert_eq!(parse_enabled(t), vec!["oisf/trafficid", "et/open"]);
+        assert!(parse_enabled("12/11/2026 -- 05:51 - <Warning> -- No enabled sources.\n").is_empty());
+        let all = parse_sources("Name: et/open\n  Summary: ET\n  License: MIT\n");
+        let e = enabled_sources(parse_enabled(t), &all);
+        assert_eq!(e[1].summary, "ET");
+        assert_eq!(e[0].name, "oisf/trafficid");
+    }
 
     #[test]
     fn parses_sources_with_ansi_and_keys() {

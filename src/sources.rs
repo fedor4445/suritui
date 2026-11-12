@@ -6,7 +6,7 @@
 //! et/open, or the router would lose the rules it has now.
 
 use crate::admin::{log_line, say, Out, Paths, Report, Runner};
-use crate::browser::{parse_sources, Source};
+use crate::browser::{enabled_sources, parse_enabled, parse_sources, Source};
 use crate::update::{begin, update_locked};
 
 const DEFAULT_SOURCE: &str = "et/open";
@@ -60,7 +60,8 @@ pub const SEPARATOR: &str = "=====index=====";
 fn index(paths: &Paths, runner: &dyn Runner) -> Result<(Vec<Source>, Vec<Source>), String> {
     let en = must(paths, runner, &["list-enabled-sources"])?;
     let all = must(paths, runner, &["list-sources"])?;
-    Ok((parse_sources(&text(&en)), parse_sources(&text(&all))))
+    let all = parse_sources(&text(&all));
+    Ok((enabled_sources(parse_enabled(&text(&en)), &all), all))
 }
 
 /// Switch a free source on (`enable`) or off, then install the new rule set.
@@ -166,8 +167,8 @@ mod tests {
                 ("su", ["list-sources"]) => out(0, INDEX),
                 ("su", ["update-sources"]) => out(0, ""),
                 ("su", ["list-enabled-sources"]) => {
-                    let e: String = self.enabled.borrow().iter().map(|n| format!("Name: {n}\n")).collect();
-                    out(0, &e)
+                    let e: String = self.enabled.borrow().iter().map(|n| format!("  - {n}\n")).collect();
+                    out(0, &format!("12/11/2026 -- 05:51:15 - <Info> -- Using data-directory /x\nEnabled sources:\n{e}"))
                 }
                 ("su", ["enable-source", n]) => {
                     self.enabled.borrow_mut().push(n.to_string());
@@ -257,7 +258,7 @@ mod tests {
         let (_t, p, f) = setup("list", &["et/open"], "");
         let l = list(&p, &f, false).unwrap().lines;
         let at = l.iter().position(|x| x == SEPARATOR).unwrap();
-        assert_eq!(parse_sources(&l[..at].join("\n")).len(), 1);
+        assert_eq!(parse_enabled(&l[..at].join("\n")), vec!["et/open"]);
         assert_eq!(parse_sources(&l[at + 1..].join("\n")).len(), 3);
     }
 

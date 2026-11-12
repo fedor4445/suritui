@@ -1966,7 +1966,7 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
             Ok(vec![])
         }
         fn sources(&self, _refresh: bool) -> Result<Vec<String>, String> {
-            Ok("Name: et/open\n  Summary: ET Open\n  License: MIT\n=====index=====\nName: et/open\n  Summary: ET Open\n  License: MIT\nName: abuse.ch/urlhaus\n  Summary: URLhaus rules\n  License: CC0-1.0\nName: et/pro\n  License: Commercial\n  Parameters: secret-code\n"
+            Ok("Enabled sources:\n  - et/open\n=====index=====\nName: et/open\n  Summary: ET Open\n  License: MIT\nName: abuse.ch/urlhaus\n  Summary: URLhaus rules\n  License: CC0-1.0\nName: et/pro\n  License: Commercial\n  Parameters: secret-code\n"
                 .lines()
                 .map(str::to_string)
                 .collect())
