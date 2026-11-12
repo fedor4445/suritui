@@ -63,6 +63,17 @@ impl RulesBrowser {
         }
     }
 
+    /// Swap in freshly read rules but keep the user's category, filter and search.
+    pub fn replace_entries(&mut self, entries: Vec<CatalogEntry>, disable: DisableConf) {
+        self.entries = entries;
+        self.disable = disable;
+        // Like `settle`, but the selection stays where it was (clamped on read).
+        if !self.categories().iter().any(|(c, _)| *c == self.category) {
+            self.category = ALL.to_string();
+            self.selected = 0;
+        }
+    }
+
     pub fn query(&self) -> &str {
         &self.query
     }

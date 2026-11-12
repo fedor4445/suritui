@@ -138,7 +138,11 @@ fn run_tui(cfg: Config) -> std::io::Result<()> {
         };
         (rules, Box::new(SshSource::new(&cfg)))
     };
+    let local = cfg.local;
     let mut app = App::new(cfg, source, rules);
+    if local {
+        app.set_admin(std::sync::Arc::new(suritui::change::LocalAdmin));
+    }
 
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -152,6 +156,14 @@ fn run_tui(cfg: Config) -> std::io::Result<()> {
         let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
         loop {
             term.draw(|f| ui::draw(f, &app))?;
+            if app.job.is_some() {
+                // A change is running: wake up often to show progress and
+                // pick up the result.
+                app.poll_job();
+                if !event::poll(std::time::Duration::from_millis(250))? {
+                    continue;
+                }
+            }
             match event::read()? {
                 // Only presses: holding a key must not repeat actions such as refresh.
                 Event::Key(k)

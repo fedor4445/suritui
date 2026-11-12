@@ -82,6 +82,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         Mode::RuleInfo => draw_rule_info(f, app, body),
         Mode::Sources => draw_sources(f, app, body),
+        Mode::Confirm => draw_confirm(f, app, body),
+        Mode::Working => draw_working(f, app, body),
+        Mode::Done => draw_done(f, app, body),
     }
     let hint = match app.mode {
         Mode::List => "  ? help   2 rules   3 sources",
@@ -91,6 +94,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         Mode::Rules => "  / search   s state   c clear   Enter rule   1 alerts   3 sources",
         Mode::Sources => "  R reload   1 alerts   2 rules   Esc back",
+        Mode::Confirm => "  y confirm   Esc cancel",
+        Mode::Working => "  working: do not close this window",
+        Mode::Done => "  Enter continue",
+        Mode::RuleInfo if app.can_change() => match app.browser.as_ref().and_then(|b| b.selected()) {
+            Some(e) if e.enabled => "  Esc back   d disable this rule",
+            Some(_) => "  Esc back   e enable this rule",
+            None => "  Esc back",
+        },
         _ => "  Esc back",
     };
     let left = Paragraph::new(Line::from(vec![
@@ -512,6 +523,68 @@ fn draw_rule_info(f: &mut Frame, app: &App, area: Rect) {
     scroll_screen(f, app, area, "Rule", lines);
 }
 
+fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let Some(p) = &app.pending else {
+        return scroll_screen(f, app, area, "Confirm", vec![Line::from("Nothing to confirm.")]);
+    };
+    let (word, what) = match p.verb {
+        crate::admin::Verb::Disable => ("Disable", "adds"),
+        crate::admin::Verb::Enable => ("Enable", "removes"),
+    };
+    let to_from = if p.verb == crate::admin::Verb::Disable { "to" } else { "from" };
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("{word} rule {}?", p.sid),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        plain(&p.msg),
+        Line::default(),
+        Line::from(format!(
+            "This {what} the sid {to_from} disable.conf, rebuilds the rules and reloads Suricata live."
+        )),
+        Line::from("The rebuild can take a couple of minutes. Suricata keeps watching with the old rules until the reload."),
+        Line::from("A backup is made first. If the check or the reload fails, the previous rules are put back."),
+        Line::default(),
+        Line::from(Span::styled(
+            "Press y to confirm, Esc to cancel.",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+    scroll_screen(f, app, area, "Confirm change", lines);
+}
+
+fn draw_working(f: &mut Frame, app: &App, area: Rect) {
+    let (word, sid, secs) = match &app.job {
+        Some(j) => (j.verb.word(), j.sid, j.started.elapsed().as_secs()),
+        None => ("change", 0, 0),
+    };
+    let lines = vec![
+        Line::from(format!("Working: {word} rule {sid} ... {secs}s")),
+        Line::default(),
+        Line::from("Rebuilding the rules and reloading Suricata. Please wait and do not close this window."),
+    ];
+    scroll_screen(f, app, area, "Working", lines);
+}
+
+fn draw_done(f: &mut Frame, app: &App, area: Rect) {
+    let (ok, text) = match &app.outcome {
+        Some((ok, l)) => (*ok, l.clone()),
+        None => (true, vec![]),
+    };
+    let mut lines = vec![if ok {
+        Line::from(Span::styled("Done", Style::default().add_modifier(Modifier::BOLD)))
+    } else {
+        Line::from(Span::styled(
+            "Failed",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    }];
+    lines.extend(text.iter().map(|l| plain(l)));
+    lines.push(Line::default());
+    lines.push(Line::from("Press Enter to go back to the rules."));
+    scroll_screen(f, app, area, if ok { "Change finished" } else { "Change failed" }, lines);
+}
+
 fn source_line(s: &crate::browser::Source) -> Line<'static> {
     let mut text = format!("{:<28} {:<12} {}", s.name, s.license, s.summary);
     if let Some(r) = &s.replaces {
@@ -576,6 +649,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("w", "raw JSON (from detail)"),
         ("R", "refresh"),
         ("2 / 3 / 1", "rules / sources / alerts"),
+        ("d / e", "rule screen: disable / enable (router)"),
+        ("y", "confirm a change (Esc cancels)"),
         ("/ s c", "rules: search / state filter / clear"),
         ("?", "this help"),
         ("q, Ctrl-C", "quit"),
@@ -1492,5 +1567,208 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         assert!(footer(&a, 100, 8).contains("/ search"));
         key(&mut a, '/');
         assert!(footer(&a, 100, 8).contains("Enter keeps it"));
+    }
+
+    // ---- changing rules (fake helper) ----
+
+    use crate::admin::Verb;
+    use crate::change::Admin;
+    use crate::local::DisableConf;
+    use crate::rules::RuleIndex;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct FakeAdmin {
+        available: bool,
+        result: Result<Vec<String>, String>,
+        delay_ms: u64,
+        after: String,
+        disable_sids: Vec<u64>,
+    }
+
+    impl Admin for FakeAdmin {
+        fn available(&self) -> bool {
+            self.available
+        }
+        fn change(&self, _v: Verb, _sid: u64) -> Result<Vec<String>, String> {
+            std::thread::sleep(Duration::from_millis(self.delay_ms));
+            self.result.clone()
+        }
+        fn reload(&self) -> Result<(RuleIndex, DisableConf), String> {
+            let mut d = DisableConf::default();
+            d.sids.extend(self.disable_sids.iter().copied());
+            Ok((RuleIndex::from_text(&self.after), d))
+        }
+    }
+
+    fn fake(result: Result<Vec<String>, String>, after: &str) -> Arc<FakeAdmin> {
+        Arc::new(FakeAdmin {
+            available: true,
+            result,
+            delay_ms: 0,
+            after: after.to_string(),
+            disable_sids: vec![2000001],
+        })
+    }
+
+    /// Rules browser with the first rule (sid 2000001, enabled) opened.
+    fn change_app(admin: Arc<FakeAdmin>) -> App {
+        let mut a = rules_app();
+        // the browser's disable.conf lists sid 2000002 only
+        a.browser.as_mut().unwrap().disable.sids.insert(2000002);
+        a.set_admin(admin);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::RuleInfo);
+        a
+    }
+
+    fn wait_done(a: &mut App) {
+        for _ in 0..200 {
+            a.poll_job();
+            if a.job.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("job did not finish");
+    }
+
+    const AFTER_DISABLED: &str = "\
+# alert tcp any any -> any any (msg:\"ET SCAN nmap probe\"; sid:2000001; rev:3;)
+# alert tcp any any -> any any (msg:\"ET MALWARE bot beacon\"; sid:2000002; rev:1;)
+alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
+";
+
+    #[test]
+    fn d_asks_first_and_esc_cancels_without_a_job() {
+        let mut a = change_app(fake(Ok(vec![]), AFTER_DISABLED));
+        assert!(footer(&a, 100, 12).contains("d disable this rule"));
+        key(&mut a, 'd');
+        assert_eq!(a.mode, Mode::Confirm);
+        let s = screen(&a, 100, 14);
+        assert!(s.contains("Disable rule 2000001?") && s.contains("Press y to confirm"), "{s}");
+        assert!(a.job.is_none());
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::RuleInfo);
+        assert!(a.job.is_none() && a.pending.is_none());
+    }
+
+    #[test]
+    fn nothing_but_y_starts_the_change() {
+        let mut a = change_app(fake(Ok(vec![]), AFTER_DISABLED));
+        key(&mut a, 'd');
+        for c in ['d', 'e', 'x', ' '] {
+            key(&mut a, c);
+        }
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Confirm);
+        assert!(a.job.is_none());
+    }
+
+    #[test]
+    fn confirmed_change_runs_refreshes_and_reports() {
+        let mut a = change_app(fake(
+            Ok(vec!["sid 2000001 disabled; Suricata reloaded".to_string()]),
+            AFTER_DISABLED,
+        ));
+        key(&mut a, 'd');
+        key(&mut a, 'y');
+        assert_eq!(a.mode, Mode::Working);
+        wait_done(&mut a);
+        assert_eq!(a.mode, Mode::Done);
+        let s = screen(&a, 100, 12);
+        assert!(s.contains("Done") && s.contains("sid 2000001 disabled"), "{s}");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Rules);
+        // the browser now shows the new state
+        let b = a.browser.as_ref().unwrap();
+        assert!(b.visible().iter().all(|e| !e.enabled || e.sid == 2000003));
+        assert!(screen(&a, 100, 12).contains("3 rules, 2 disabled"));
+    }
+
+    #[test]
+    fn failed_change_is_shown_and_state_is_kept() {
+        let mut a = change_app(fake(Err("the rebuild failed (exit 1): boom".into()), AFTER_DISABLED));
+        key(&mut a, 'd');
+        key(&mut a, 'y');
+        wait_done(&mut a);
+        let s = screen(&a, 100, 12);
+        assert!(s.contains("Failed") && s.contains("boom"), "{s}");
+        press(&mut a, KeyCode::Enter);
+        assert!(screen(&a, 100, 12).contains("3 rules, 1 disabled"));
+    }
+
+    #[test]
+    fn keys_are_ignored_while_the_helper_works() {
+        let mut a = change_app(Arc::new(FakeAdmin {
+            available: true,
+            result: Ok(vec![]),
+            delay_ms: 300,
+            after: AFTER_DISABLED.to_string(),
+            disable_sids: vec![],
+        }));
+        key(&mut a, 'd');
+        key(&mut a, 'y');
+        assert_eq!(a.mode, Mode::Working);
+        for c in ['q', 'y', 'n', 'j'] {
+            assert!(!crate::input::handle_key(
+                &mut a,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+            ));
+        }
+        assert!(!crate::input::handle_key(
+            &mut a,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ));
+        assert_eq!(a.mode, Mode::Working);
+        assert!(screen(&a, 100, 8).contains("do not close"));
+        wait_done(&mut a);
+        assert_eq!(a.mode, Mode::Done);
+    }
+
+    #[test]
+    fn enable_needs_the_sid_in_disable_conf() {
+        let mut a = change_app(fake(Ok(vec![]), AFTER_DISABLED));
+        press(&mut a, KeyCode::Esc);
+        key(&mut a, 's'); // disabled only -> sid 2000002, which the fake lists
+        press(&mut a, KeyCode::Enter);
+        key(&mut a, 'e');
+        assert_eq!(a.mode, Mode::Confirm);
+        assert!(screen(&a, 100, 12).contains("Enable rule 2000002?"));
+        press(&mut a, KeyCode::Esc);
+        // a rule off by group/source: not in disable.conf by sid
+        a.browser.as_mut().unwrap().disable.sids.clear();
+        key(&mut a, 'e');
+        assert_eq!(a.mode, Mode::RuleInfo);
+        assert!(a.status.contains("group or in the source"), "{}", a.status);
+    }
+
+    #[test]
+    fn wrong_direction_and_missing_helper_are_explained() {
+        let mut a = change_app(fake(Ok(vec![]), AFTER_DISABLED));
+        key(&mut a, 'e'); // rule is enabled already
+        assert!(a.status.contains("already enabled"), "{}", a.status);
+        let mut a = rules_app();
+        press(&mut a, KeyCode::Enter);
+        key(&mut a, 'd'); // remote mode: no helper object
+        assert!(a.status.contains("only on the router"), "{}", a.status);
+        let mut a = change_app(Arc::new(FakeAdmin {
+            available: false,
+            result: Ok(vec![]),
+            delay_ms: 0,
+            after: String::new(),
+            disable_sids: vec![],
+        }));
+        key(&mut a, 'd');
+        assert!(a.status.contains("not installed"), "{}", a.status);
+        assert!(!footer(&a, 100, 12).contains("d disable"));
+    }
+
+    #[test]
+    fn help_lists_the_change_keys() {
+        let mut a = sample();
+        a.mode = Mode::Help;
+        let s = screen(&a, 100, 40);
+        assert!(s.contains("disable / enable") && s.contains("confirm a change"), "{s}");
     }
 }

@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod alert;
 pub mod browser;
+pub mod change;
 pub mod config;
 pub mod input;
 pub mod local;

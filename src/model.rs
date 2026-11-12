@@ -3,12 +3,15 @@
 
 use crate::alert::{category, is_informational, Alert};
 use crate::browser::{self, RulesBrowser, SourcesView};
+use crate::admin::Verb;
+use crate::change::{Admin, Job, Outcome, Pending};
 use crate::config::Config;
 use crate::local::{self, DisableConf};
 use crate::rules::{rev_warning, RuleIndex};
 use crate::source::{AlertSource, Loaded, Range, SourceError};
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const MAX_DAY: u8 = 13;
 const ALL: &str = "All";
@@ -26,6 +29,12 @@ pub enum Mode {
     RuleInfo,
     /// Rule sources.
     Sources,
+    /// Asking before a rule is disabled or enabled.
+    Confirm,
+    /// The helper is working.
+    Working,
+    /// The helper has finished.
+    Done,
 }
 
 impl Mode {
@@ -33,7 +42,14 @@ impl Mode {
     pub fn scrolls(self) -> bool {
         matches!(
             self,
-            Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help | Mode::RuleInfo | Mode::Sources
+            Mode::Detail
+                | Mode::Rule
+                | Mode::Raw
+                | Mode::Help
+                | Mode::RuleInfo
+                | Mode::Sources
+                | Mode::Confirm
+                | Mode::Done
         )
     }
 }
@@ -74,6 +90,10 @@ pub struct App {
     rules: Option<RuleIndex>,
     pub browser: Option<RulesBrowser>,
     pub sources: Option<SourcesView>,
+    admin: Option<Arc<dyn Admin>>,
+    pub pending: Option<Pending>,
+    pub job: Option<Job>,
+    pub outcome: Option<(bool, Vec<String>)>,
     cache: HashMap<Range, Loaded>,
     pub mode: Mode,
     pub range: Range,
@@ -108,6 +128,10 @@ impl App {
             rules,
             browser: None,
             sources: None,
+            admin: None,
+            pending: None,
+            job: None,
+            outcome: None,
             cache: HashMap::new(),
             mode: Mode::List,
             range: Range::Today,
@@ -266,6 +290,111 @@ impl App {
     pub fn browser_rule(&self) -> Option<&crate::rules::Rule> {
         let sid = self.browser.as_ref()?.selected()?.sid;
         self.rules.as_ref()?.lookup(sid)
+    }
+
+    /// Enable rule changes (local mode only).
+    pub fn set_admin(&mut self, a: Arc<dyn Admin>) {
+        self.admin = Some(a);
+    }
+
+    pub fn can_change(&self) -> bool {
+        self.admin.as_ref().is_some_and(|a| a.available())
+    }
+
+    /// `d` / `e` on the rule screen: ask first, change nothing yet.
+    pub fn request_change(&mut self, want: Verb) {
+        let Some(admin) = &self.admin else {
+            self.status = "changing rules works only on the router (--local)".to_string();
+            return;
+        };
+        if !admin.available() {
+            self.status = "the helper suritui-admin is not installed here".to_string();
+            return;
+        }
+        let Some(b) = &self.browser else { return };
+        let Some(e) = b.selected() else { return };
+        let verb = if e.enabled { Verb::Disable } else { Verb::Enable };
+        if verb != want {
+            self.status = format!("this rule is already {}d", want.word());
+            return;
+        }
+        if verb == Verb::Enable && !b.disable.sids.contains(&e.sid) {
+            self.status = "this rule is off by a group or in the source; enabling it is not supported yet".to_string();
+            return;
+        }
+        self.status.clear();
+        self.pending = Some(Pending {
+            verb,
+            sid: e.sid,
+            msg: e.msg.clone(),
+        });
+        self.set_mode(Mode::Confirm);
+    }
+
+    pub fn cancel_change(&mut self) {
+        self.pending = None;
+        self.set_mode(Mode::RuleInfo);
+    }
+
+    /// The confirming second keystroke: start the helper in the background.
+    pub fn confirm_change(&mut self) {
+        let (Some(p), Some(admin)) = (self.pending.take(), self.admin.clone()) else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (verb, sid) = (p.verb, p.sid);
+        std::thread::spawn(move || {
+            let out = match admin.change(verb, sid) {
+                Ok(lines) => match admin.reload() {
+                    Ok(fresh) => Outcome { ok: true, lines, fresh: Some(fresh) },
+                    Err(e) => {
+                        let mut lines = lines;
+                        lines.push(format!("(could not re-read the rules: {e})"));
+                        Outcome { ok: true, lines, fresh: None }
+                    }
+                },
+                Err(e) => Outcome { ok: false, lines: vec![e], fresh: None },
+            };
+            let _ = tx.send(out);
+        });
+        self.job = Some(Job {
+            rx,
+            started: std::time::Instant::now(),
+            verb,
+            sid,
+        });
+        self.set_mode(Mode::Working);
+    }
+
+    /// Called by the main loop; picks up a finished job.
+    pub fn poll_job(&mut self) {
+        let Some(job) = &self.job else { return };
+        let done = match job.rx.try_recv() {
+            Ok(o) => Some(o),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Outcome {
+                ok: false,
+                lines: vec!["the change stopped unexpectedly; check the rules and Suricata".to_string()],
+                fresh: None,
+            }),
+        };
+        let Some(o) = done else { return };
+        self.job = None;
+        if let Some((idx, disable)) = o.fresh {
+            let entries = local::catalog(&idx);
+            self.rules = Some(idx);
+            match &mut self.browser {
+                Some(b) => b.replace_entries(entries, disable),
+                None => self.browser = Some(RulesBrowser::new(entries, disable)),
+            }
+        }
+        self.outcome = Some((o.ok, o.lines));
+        self.set_mode(Mode::Done);
+    }
+
+    pub fn dismiss_outcome(&mut self) {
+        self.outcome = None;
+        self.set_mode(Mode::Rules);
     }
 
     pub fn is_local(&self) -> bool {

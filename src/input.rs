@@ -1,5 +1,6 @@
 //! Key handling: maps key events onto model transitions.
 
+use crate::admin::Verb;
 use crate::model::{App, Mode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -11,6 +12,11 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 /// never shows data that has shifted under it.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if key.kind == KeyEventKind::Release {
+        return false;
+    }
+    // While the helper works nothing is accepted: quitting now would leave
+    // a half-finished change behind.
+    if app.mode == Mode::Working {
         return false;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -52,6 +58,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (Mode::Sources, KeyCode::Char('2')) => app.open_rules(),
         (Mode::Sources, KeyCode::Char('R')) => app.reload_sources(),
         (Mode::Rules, code) => rules_key(app, code),
+        (Mode::RuleInfo, KeyCode::Char('d')) => app.request_change(Verb::Disable),
+        (Mode::RuleInfo, KeyCode::Char('e')) => app.request_change(Verb::Enable),
+        (Mode::Confirm, KeyCode::Char('y')) => app.confirm_change(),
+        (Mode::Confirm, KeyCode::Esc | KeyCode::Char('n')) => app.cancel_change(),
+        (Mode::Done, KeyCode::Enter | KeyCode::Esc) => app.dismiss_outcome(),
         (m, KeyCode::Char('j') | KeyCode::Down) if m.scrolls() => app.scroll_lines(1),
         (m, KeyCode::Char('k') | KeyCode::Up) if m.scrolls() => app.scroll_lines(-1),
         (m, KeyCode::PageDown) if m.scrolls() => app.scroll_page(1),
