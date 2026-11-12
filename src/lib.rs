@@ -7,6 +7,7 @@ pub mod input;
 pub mod local;
 pub mod model;
 pub mod rules;
+pub mod update;
 pub mod source;
 pub mod ui;
 

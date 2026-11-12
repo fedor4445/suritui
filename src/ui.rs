@@ -1,6 +1,7 @@
 //! Rendering: sidebar, list, detail, rule, raw and help screens.
 
 use crate::alert::Alert;
+use crate::change::Action;
 use crate::model::{group, App, Mode, RuleView};
 use crate::source::Range;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -82,12 +83,13 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         Mode::RuleInfo => draw_rule_info(f, app, body),
         Mode::Sources => draw_sources(f, app, body),
+        Mode::Updates => draw_updates(f, app, body),
         Mode::Confirm => draw_confirm(f, app, body),
         Mode::Working => draw_working(f, app, body),
         Mode::Done => draw_done(f, app, body),
     }
     let hint = match app.mode {
-        Mode::List => "  ? help   2 rules   3 sources",
+        Mode::List => "  ? help   2 rules   3 sources   4 updates",
         Mode::Detail if app.can_change() => "  Esc back   r rule text   w raw JSON   d disable this rule",
         Mode::Detail => "  Esc back   r rule text   w raw JSON",
         Mode::Rule if app.can_change() => "  Esc back   d disable this rule",
@@ -97,6 +99,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Rules if app.can_change() => "  / search   s state   d disable   e enable   Enter rule   1 alerts",
         Mode::Rules => "  / search   s state   c clear   Enter rule   1 alerts   3 sources",
         Mode::Sources => "  R reload   1 alerts   2 rules   Esc back",
+        Mode::Updates if app.can_change() => "  U update now   R reload   1 alerts   2 rules   3 sources",
+        Mode::Updates => "  R reload   1 alerts   2 rules   3 sources",
         Mode::Confirm => "  y confirm   Esc cancel",
         Mode::Working => "  working: do not close this window",
         Mode::Done => "  Enter continue",
@@ -532,15 +536,13 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     let Some(p) = &app.pending else {
         return scroll_screen(f, app, area, "Confirm", vec![Line::from("Nothing to confirm.")]);
     };
-    let word = match p.verb {
-        crate::admin::Verb::Disable => "Disable",
-        crate::admin::Verb::Enable => "Enable",
+    let title = match p.action {
+        Action::Rule(crate::admin::Verb::Disable, sid) => format!("Disable rule {sid}?"),
+        Action::Rule(crate::admin::Verb::Enable, sid) => format!("Enable rule {sid}?"),
+        Action::Update => "Update the rules now?".to_string(),
     };
     let lines = vec![
-        Line::from(Span::styled(
-            format!("{word} rule {}?", p.sid),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(title, Style::default().add_modifier(Modifier::BOLD))),
         plain(&p.msg),
         Line::default(),
         Line::from(format!("This {}, rebuilds the rules and reloads Suricata live.", p.how)),
@@ -555,13 +557,27 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     scroll_screen(f, app, area, "Confirm change", lines);
 }
 
+fn draw_updates(f: &mut Frame, app: &App, area: Rect) {
+    let lines: Vec<Line<'static>> = match &app.updates {
+        Some(l) => l.iter().map(|t| plain(t)).collect(),
+        None => vec![Line::from("Not loaded.")],
+    };
+    scroll_screen(f, app, area, "Updates and status", lines);
+}
+
 fn draw_working(f: &mut Frame, app: &App, area: Rect) {
-    let (word, sid, secs) = match &app.job {
-        Some(j) => (j.verb.word(), j.sid, j.started.elapsed().as_secs()),
-        None => ("change", 0, 0),
+    let (what, secs) = match &app.job {
+        Some(j) => (
+            match j.action {
+                Action::Rule(v, sid) => format!("{} rule {sid}", v.word()),
+                Action::Update => "updating the rules".to_string(),
+            },
+            j.started.elapsed().as_secs(),
+        ),
+        None => ("change".to_string(), 0),
     };
     let lines = vec![
-        Line::from(format!("Working: {word} rule {sid} ... {secs}s")),
+        Line::from(format!("Working: {what} ... {secs}s")),
         Line::default(),
         Line::from("Rebuilding the rules and reloading Suricata. Please wait and do not close this window."),
     ];
@@ -650,7 +666,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("r", "rule text (from detail)"),
         ("w", "raw JSON (from detail)"),
         ("R", "refresh"),
-        ("2 / 3 / 1", "rules / sources / alerts"),
+        ("2 / 3 / 4 / 1", "rules / sources / updates / alerts"),
+        ("U", "updates screen: update the rules now (router)"),
         ("d / e", "disable / enable a rule: rules list, rule screen; d on an alert (router)"),
         ("y", "confirm a change (Esc cancels)"),
         ("/ s c", "rules: search / state filter / clear"),
@@ -1853,5 +1870,103 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         key(&mut a, 'd');
         assert_eq!(a.mode, Mode::Detail);
         assert!(a.status.contains("no rules"), "{}", a.status);
+    }
+
+    // ---- Updates screen ----
+
+    struct FakeUpd {
+        info_calls: std::sync::atomic::AtomicUsize,
+        update_result: Result<Vec<String>, String>,
+    }
+
+    impl Admin for FakeUpd {
+        fn available(&self) -> bool {
+            true
+        }
+        fn change(&self, _v: Verb, _sid: u64) -> Result<Vec<String>, String> {
+            Ok(vec![])
+        }
+        fn update(&self) -> Result<Vec<String>, String> {
+            self.update_result.clone()
+        }
+        fn info(&self) -> Result<Vec<String>, String> {
+            let n = self.info_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(vec![format!("Suricata: running (reading {n})"), "Update running now: no".to_string()])
+        }
+        fn reload(&self) -> Result<(RuleIndex, DisableConf), String> {
+            Ok((RuleIndex::from_text(RULES), DisableConf::default()))
+        }
+    }
+
+    fn upd_app(result: Result<Vec<String>, String>) -> App {
+        let mut a = rules_app();
+        a.set_admin(Arc::new(FakeUpd {
+            info_calls: std::sync::atomic::AtomicUsize::new(0),
+            update_result: result,
+        }));
+        press(&mut a, KeyCode::Esc); // back to the alerts list
+        a
+    }
+
+    #[test]
+    fn four_opens_updates_and_needs_local_mode() {
+        let mut a = app(vec![]);
+        key(&mut a, '4');
+        assert_eq!(a.mode, Mode::List);
+        assert!(a.status.contains("--local"), "{}", a.status);
+        let mut a = upd_app(Ok(vec![]));
+        key(&mut a, '4');
+        assert_eq!(a.mode, Mode::Updates);
+        let s = screen(&a, 100, 10);
+        assert!(s.contains("Updates and status") && s.contains("Suricata: running (reading 1)"), "{s}");
+        assert!(footer(&a, 100, 10).contains("U update now"));
+        key(&mut a, 'R');
+        assert!(screen(&a, 100, 10).contains("reading 2"));
+        key(&mut a, '2');
+        assert_eq!(a.mode, Mode::Rules);
+        key(&mut a, '4');
+        assert_eq!(a.mode, Mode::Updates);
+        key(&mut a, '1');
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn u_asks_then_updates_and_comes_back_with_fresh_status() {
+        let mut a = upd_app(Ok(vec!["rules updated: 3 added, 1 removed, 2 changed; Suricata reloaded".into()]));
+        key(&mut a, '4');
+        key(&mut a, 'U');
+        assert_eq!(a.mode, Mode::Confirm);
+        let s = screen(&a, 120, 14);
+        assert!(s.contains("Update the rules now?") && s.contains("Press y to confirm"), "{s}");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::Updates, "Esc goes back to the Updates screen");
+        key(&mut a, 'U');
+        key(&mut a, 'y');
+        assert_eq!(a.mode, Mode::Working);
+        assert!(screen(&a, 100, 8).contains("updating the rules"));
+        wait_done(&mut a);
+        assert!(screen(&a, 100, 10).contains("3 added, 1 removed"));
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Updates);
+        assert!(screen(&a, 100, 10).contains("reading 2"), "the status is read again after an update");
+    }
+
+    #[test]
+    fn a_failed_update_is_reported() {
+        let mut a = upd_app(Err("the update has 5 rules but 69,367 are loaded now".into()));
+        key(&mut a, '4');
+        key(&mut a, 'U');
+        key(&mut a, 'y');
+        wait_done(&mut a);
+        let s = screen(&a, 100, 10);
+        assert!(s.contains("Failed") && s.contains("5 rules"), "{s}");
+    }
+
+    #[test]
+    fn help_lists_the_updates_keys() {
+        let mut a = sample();
+        a.mode = Mode::Help;
+        let s = screen(&a, 100, 40);
+        assert!(s.contains("updates") && s.contains("update the rules now"), "{s}");
     }
 }

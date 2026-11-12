@@ -53,6 +53,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (Mode::List, KeyCode::Char('?')) => app.set_mode(Mode::Help),
         (Mode::List, KeyCode::Char('2')) => app.open_rules(),
         (Mode::List, KeyCode::Char('3')) => app.open_sources(),
+        (Mode::List | Mode::Rules | Mode::Sources, KeyCode::Char('4')) => app.open_updates(),
+        (Mode::Updates, KeyCode::Char('1')) => app.set_mode(Mode::List),
+        (Mode::Updates, KeyCode::Char('2')) => app.open_rules(),
+        (Mode::Updates, KeyCode::Char('3')) => app.open_sources(),
+        (Mode::Updates, KeyCode::Char('R')) => app.load_updates(),
+        (Mode::Updates, KeyCode::Char('U')) => app.request_update(),
         (Mode::Rules | Mode::Sources, KeyCode::Char('1')) => app.set_mode(Mode::List),
         (Mode::Rules, KeyCode::Char('3')) => app.open_sources(),
         (Mode::Sources, KeyCode::Char('2')) => app.open_rules(),
@@ -72,7 +78,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (m, KeyCode::Char('G') | KeyCode::End) if m.scrolls() => app.scroll_to_bottom(),
         (Mode::Detail, KeyCode::Char('r')) => app.set_mode(Mode::Rule),
         (Mode::Detail, KeyCode::Char('w')) => app.set_mode(Mode::Raw),
-        (Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help | Mode::Sources, KeyCode::Esc) => {
+        (Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help | Mode::Sources | Mode::Updates, KeyCode::Esc) => {
             app.set_mode(Mode::List)
         }
         (Mode::RuleInfo, KeyCode::Esc) => app.set_mode(Mode::Rules),

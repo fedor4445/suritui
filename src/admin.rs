@@ -48,7 +48,7 @@ pub fn parse_sid(s: &str) -> Option<u64> {
 
 /// The sid a disable.conf line names (`2012345` or `1:2012345`), if it is a
 /// plain sid line. Comments, groups and patterns give None.
-fn line_sid(line: &str) -> Option<u64> {
+pub(crate) fn line_sid(line: &str) -> Option<u64> {
     let t = line.trim();
     if t.is_empty() || t.starts_with('#') || t.starts_with("group:") || t.starts_with("re:") {
         return None;
@@ -136,7 +136,7 @@ pub fn plan_change(dc: &str, ec: &str, verb: Verb, sid: u64, date: &str) -> Plan
     }
 }
 
-fn rule_map(text: &str) -> HashMap<u64, (bool, String)> {
+pub(crate) fn rule_map(text: &str) -> HashMap<u64, (bool, String)> {
     let mut m = HashMap::new();
     for line in text.lines() {
         if let Some(r) = parse_line(line) {
@@ -277,6 +277,8 @@ pub struct Paths {
     pub rules: PathBuf,
     pub build_dir: PathBuf,
     pub backup_root: PathBuf,
+    pub cache_dir: PathBuf,
+    pub update_log: PathBuf,
     pub eve_dir: PathBuf,
     pub lock: PathBuf,
     pub log: PathBuf,
@@ -295,6 +297,8 @@ impl Paths {
             // a symlink that the root helper would write through.
             build_dir: "/var/db/suritui-build".into(),
             backup_root: "/var/backups/suritui".into(),
+            cache_dir: "/var/lib/suricata/update/cache".into(),
+            update_log: "/var/log/suricata/update.log".into(),
             eve_dir: "/var/log/suricata".into(),
             lock: "/var/run/suritui-admin.lock".into(),
             log: "/var/log/suritui-admin.log".into(),
@@ -305,14 +309,14 @@ impl Paths {
     }
 }
 
-fn io(what: &str, e: std::io::Error) -> String {
+pub(crate) fn io(what: &str, e: std::io::Error) -> String {
     format!("{what}: {e}")
 }
 
-struct Lock(PathBuf);
+pub(crate) struct Lock(PathBuf);
 
 impl Lock {
-    fn take(path: &Path, runner: &dyn Runner) -> Result<Lock, String> {
+    pub(crate) fn take(path: &Path, runner: &dyn Runner) -> Result<Lock, String> {
         for attempt in 0..2 {
             match fs::OpenOptions::new().write(true).create_new(true).open(path) {
                 Ok(mut f) => {
@@ -351,7 +355,7 @@ impl Drop for Lock {
 /// Write `data` to `path` the safe way for a directory another user can write
 /// to: a fresh staging file created with O_EXCL (never through a symlink), owner
 /// and mode set on the open file, then an atomic rename over `path`.
-fn put(path: &Path, data: &[u8], like: &fs::Metadata) -> Result<(), String> {
+pub(crate) fn put(path: &Path, data: &[u8], like: &fs::Metadata) -> Result<(), String> {
     use std::io::Write;
     let mut name = path.as_os_str().to_os_string();
     name.push(".suritui-new");
@@ -384,7 +388,7 @@ fn put(path: &Path, data: &[u8], like: &fs::Metadata) -> Result<(), String> {
 }
 
 /// A live file must be a plain file, not a symlink or anything else.
-fn plain_file(path: &Path) -> Result<fs::Metadata, String> {
+pub(crate) fn plain_file(path: &Path) -> Result<fs::Metadata, String> {
     let m = fs::symlink_metadata(path).map_err(|e| io(&format!("cannot stat {}", path.display()), e))?;
     if !m.file_type().is_file() {
         return Err(format!("{} is not a regular file; refusing", path.display()));
@@ -402,7 +406,7 @@ impl Mode600 for fs::OpenOptions {
     }
 }
 
-fn prune_backups(root: &Path) {
+pub(crate) fn prune_backups(root: &Path) {
     let Ok(rd) = fs::read_dir(root) else { return };
     let mut dirs: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect();
     dirs.sort();
@@ -417,11 +421,11 @@ pub struct Report {
     pub lines: Vec<String>,
 }
 
-fn say(r: &mut Report, s: impl Into<String>) {
+pub(crate) fn say(r: &mut Report, s: impl Into<String>) {
     r.lines.push(s.into());
 }
 
-fn log_line(paths: &Paths, runner: &dyn Runner, msg: &str) {
+pub(crate) fn log_line(paths: &Paths, runner: &dyn Runner, msg: &str) {
     use std::io::Write;
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&paths.log) {
         let _ = writeln!(f, "{} {msg}", ymd(now()));
@@ -429,21 +433,21 @@ fn log_line(paths: &Paths, runner: &dyn Runner, msg: &str) {
     let _ = runner.run("/usr/bin/logger", &["-t", "suritui-admin", msg]);
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn suricata_running(runner: &dyn Runner) -> bool {
+pub(crate) fn suricata_running(runner: &dyn Runner) -> bool {
     runner
         .run("/bin/pgrep", &["-x", "suricata"])
         .map(|o| o.code == Some(0))
         .unwrap_or(false)
 }
 
-fn reload(paths: &Paths, runner: &dyn Runner) -> Result<(), String> {
+pub(crate) fn reload(paths: &Paths, runner: &dyn Runner) -> Result<(), String> {
     let o = runner.run(&paths.suricatasc, &["-c", "ruleset-reload-nonblocking"])?;
     let ok_reply = o.stdout.contains("\"return\": \"OK\"") || o.stdout.contains("\"return\":\"OK\"");
     if o.code == Some(0) && ok_reply {
@@ -460,6 +464,75 @@ fn reload(paths: &Paths, runner: &dyn Runner) -> Result<(), String> {
             if why.is_empty() { "no answer from Suricata: is it running?" } else { &why }
         ))
     }
+}
+
+/// One file to replace: what it should hold afterwards and what it held before
+/// (`None` = absent). Texts are borrowed so the 46 MB rules file is not copied.
+pub(crate) struct Swap<'a> {
+    pub path: PathBuf,
+    pub new: Option<&'a str>,
+    pub old: Option<&'a str>,
+    pub meta: &'a fs::Metadata,
+}
+
+fn put_or_remove(path: &Path, text: Option<&str>, meta: &fs::Metadata) -> Result<(), String> {
+    match text {
+        Some(t) => put(path, t.as_bytes(), meta),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io("remove", e)),
+        },
+    }
+}
+
+/// Install every changed file in order, reload Suricata live and check that it
+/// is still running. On any failure all files go back and Suricata reloads again.
+pub(crate) fn commit_swaps(
+    paths: &Paths,
+    runner: &dyn Runner,
+    swaps: &[Swap],
+    backup: &Path,
+    what: &str,
+) -> Result<(), String> {
+    let restore = || -> Result<(), String> {
+        let mut result = Ok(());
+        for sw in swaps.iter().rev().filter(|sw| sw.new != sw.old) {
+            let r = put_or_remove(&sw.path, sw.old, sw.meta);
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        result
+    };
+    for sw in swaps.iter().filter(|sw| sw.new != sw.old) {
+        if let Err(e) = put_or_remove(&sw.path, sw.new, sw.meta) {
+            let _ = restore();
+            return Err(format!("{e} (previous files restored)"));
+        }
+    }
+    let reloaded = reload(paths, runner);
+    let healthy = reloaded.is_ok() && {
+        std::thread::sleep(std::time::Duration::from_secs(if paths.require_root { 3 } else { 0 }));
+        suricata_running(runner)
+    };
+    if healthy {
+        return Ok(());
+    }
+    let restored = restore();
+    let again = reload(paths, runner);
+    let tail = match (&restored, &again) {
+        (Ok(()), Ok(())) => " and reloaded".to_string(),
+        (Ok(()), Err(_)) => {
+            ". The files are restored, but Suricata did not accept a reload: check that it is running".to_string()
+        }
+        (Err(e), _) => format!(". Restoring the files failed ({e}): the backup is in {}", backup.display()),
+    };
+    log_line(paths, runner, &format!("FAILED {what}: restored the previous rules"));
+    Err(format!(
+        "Suricata did not take the new rules ({}); the previous rules are back{tail}",
+        reloaded.err().unwrap_or_else(|| "it stopped running".into()),
+    ))
 }
 
 /// Build the rules for one candidate into the scratch directory and return them.
@@ -571,63 +644,16 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
     fs::copy(&paths.rules, backup.join("suricata.rules")).map_err(|e| io("backup of the rules", e))?;
     say(&mut rep, format!("backup: {}", backup.display()));
 
-    // 4. install: staged next to the live files, then atomic renames. Whatever
-    // fails later is undone from the originals held in memory.
-    let write_enable = |p: &Paths, text: &str| -> Result<(), String> {
-        if text.trim().is_empty() {
-            // An empty enable.conf is the same as none; keep the directory tidy.
-            return match fs::remove_file(&p.enable_conf) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(io("remove enable.conf", e)),
-            };
-        }
-        put(&p.enable_conf, text.as_bytes(), &ec_meta)
-    };
-    let restore = |p: &Paths| {
-        let a = put(&p.disable_conf, dc_text.as_bytes(), &dc_meta);
-        let b = if ec_exists {
-            put(&p.enable_conf, ec_text.as_bytes(), &ec_meta)
-        } else {
-            write_enable(p, "")
-        };
-        let c = put(&p.rules, live_rules.as_bytes(), &rules_meta);
-        a.and(b).and(c)
-    };
-    if cand.disable != dc_text {
-        put(&paths.disable_conf, cand.disable.as_bytes(), &dc_meta)?;
-    }
-    if cand.enable != ec_text {
-        if let Err(e) = write_enable(paths, &cand.enable) {
-            let _ = restore(paths);
-            return Err(format!("{e} (previous files restored)"));
-        }
-    }
-    if let Err(e) = put(&paths.rules, cand_rules.as_bytes(), &rules_meta) {
-        let _ = restore(paths);
-        return Err(format!("{e} (previous files restored)"));
-    }
-
-    // 5. live reload; put everything back if Suricata does not take it
-    let reloaded = reload(paths, runner);
-    let healthy = reloaded.is_ok() && {
-        std::thread::sleep(std::time::Duration::from_secs(if paths.require_root { 3 } else { 0 }));
-        suricata_running(runner)
-    };
-    if !healthy {
-        let restored = restore(paths);
-        let again = reload(paths, runner);
-        let tail = match (&restored, &again) {
-            (Ok(()), Ok(())) => " and reloaded".to_string(),
-            (Ok(()), Err(_)) => ". The files are restored, but Suricata did not accept a reload: check that it is running".to_string(),
-            (Err(e), _) => format!(". Restoring the files failed ({e}): the backup is in {}", backup.display()),
-        };
-        log_line(paths, runner, &format!("FAILED {} sid {sid}: restored the previous rules", verb.word()));
-        return Err(format!(
-            "Suricata did not take the new rules ({}); the previous rules are back{tail}",
-            reloaded.err().unwrap_or_else(|| "it stopped running".into()),
-        ));
-    }
+    // 4./5. install the new files and reload; everything is undone from the
+    // originals held in memory if any step fails.
+    let new_ec = (!cand.enable.trim().is_empty()).then_some(cand.enable.as_str());
+    let old_ec = ec_exists.then_some(ec_text.as_str());
+    let swaps = [
+        Swap { path: paths.disable_conf.clone(), new: Some(&cand.disable), old: Some(&dc_text), meta: &dc_meta },
+        Swap { path: paths.enable_conf.clone(), new: new_ec, old: old_ec, meta: &ec_meta },
+        Swap { path: paths.rules.clone(), new: Some(&cand_rules), old: Some(&live_rules), meta: &rules_meta },
+    ];
+    commit_swaps(paths, runner, &swaps, &backup, &format!("{} sid {sid}", verb.word()))?;
     prune_backups(&paths.backup_root);
     log_line(paths, runner, &format!("{} sid {sid} (backup {stamp})", verb.word()));
     say(&mut rep, format!("sid {sid} {}d; Suricata reloaded", verb.word()));
@@ -959,6 +985,8 @@ mod tests {
             rules: d.join("suricata.rules"),
             build_dir: d.join("build"),
             backup_root: d.join("backups"),
+            cache_dir: d.join("cache"),
+            update_log: d.join("update.log"),
             eve_dir: d.join("eve"),
             lock: d.join("lock"),
             log: d.join("log"),

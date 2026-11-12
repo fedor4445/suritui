@@ -4,7 +4,7 @@
 use crate::alert::{category, is_informational, Alert};
 use crate::browser::{self, RulesBrowser, SourcesView};
 use crate::admin::Verb;
-use crate::change::{Admin, Job, Outcome, Pending};
+use crate::change::{Action, Admin, Job, Outcome, Pending};
 use crate::config::Config;
 use crate::local::{self, DisableConf};
 use crate::rules::{rev_warning, RuleIndex};
@@ -33,6 +33,8 @@ pub enum Mode {
     Confirm,
     /// The helper is working.
     Working,
+    /// Suricata health and rule updates.
+    Updates,
     /// The helper has finished.
     Done,
 }
@@ -50,6 +52,7 @@ impl Mode {
                 | Mode::Sources
                 | Mode::Confirm
                 | Mode::Done
+                | Mode::Updates
         )
     }
 }
@@ -94,6 +97,7 @@ pub struct App {
     pub pending: Option<Pending>,
     pub job: Option<Job>,
     pub outcome: Option<(bool, Vec<String>)>,
+    pub updates: Option<Vec<String>>,
     after_done: Mode,
     cache: HashMap<Range, Loaded>,
     pub mode: Mode,
@@ -133,6 +137,7 @@ impl App {
             pending: None,
             job: None,
             outcome: None,
+            updates: None,
             after_done: Mode::Rules,
             cache: HashMap::new(),
             mode: Mode::List,
@@ -369,8 +374,7 @@ impl App {
         };
         self.status.clear();
         self.pending = Some(Pending {
-            verb,
-            sid,
+            action: Action::Rule(verb, sid),
             msg: e.msg.clone(),
             how,
             from: self.mode,
@@ -389,11 +393,15 @@ impl App {
             return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        let (verb, sid) = (p.verb, p.sid);
+        let action = p.action;
         // Back to where the change started: the alert list for an alert's rule.
-        self.after_done = if matches!(p.from, Mode::Detail | Mode::Rule) { Mode::List } else { Mode::Rules };
+        self.after_done = match (action, p.from) {
+            (Action::Update, _) => Mode::Updates,
+            (_, Mode::Detail | Mode::Rule) => Mode::List,
+            _ => Mode::Rules,
+        };
         std::thread::spawn(move || {
-            let out = match admin.change(verb, sid) {
+            let out = match admin.run(action) {
                 Ok(lines) => match admin.reload() {
                     Ok(fresh) => Outcome { ok: true, lines, fresh: Some(fresh) },
                     Err(e) => {
@@ -409,8 +417,7 @@ impl App {
         self.job = Some(Job {
             rx,
             started: std::time::Instant::now(),
-            verb,
-            sid,
+            action,
         });
         self.set_mode(Mode::Working);
     }
@@ -443,7 +450,47 @@ impl App {
 
     pub fn dismiss_outcome(&mut self) {
         self.outcome = None;
+        if self.after_done == Mode::Updates {
+            self.load_updates();
+        }
         self.set_mode(self.after_done);
+    }
+
+    /// Open the Updates screen (router only: it asks the helper).
+    pub fn open_updates(&mut self) {
+        if self.admin.is_none() {
+            self.status = "updates and status are only available on the router (use --local)".to_string();
+            return;
+        }
+        if self.updates.is_none() {
+            self.load_updates();
+        }
+        self.status.clear();
+        self.set_mode(Mode::Updates);
+    }
+
+    pub fn load_updates(&mut self) {
+        let Some(admin) = &self.admin else { return };
+        self.updates = Some(admin.info().unwrap_or_else(|e| vec![format!("Could not read the status: {e}")]));
+    }
+
+    /// `U` on the Updates screen: ask first.
+    pub fn request_update(&mut self) {
+        let Some(admin) = &self.admin else { return };
+        if !admin.available() {
+            self.status = "the helper suritui-admin is not installed here".to_string();
+            return;
+        }
+        self.status.clear();
+        self.pending = Some(Pending {
+            action: Action::Update,
+            msg: "Download the newest rules and install them now".to_string(),
+            how: "downloads the newest ET Open rules (the same download as the daily update), keeps your \
+                  disable.conf and enable.conf choices"
+                .to_string(),
+            from: self.mode,
+        });
+        self.set_mode(Mode::Confirm);
     }
 
     pub fn is_local(&self) -> bool {
@@ -658,6 +705,9 @@ impl App {
         }
         if self.mode == Mode::Sources {
             return "rule sources".to_string();
+        }
+        if self.mode == Mode::Updates {
+            return "updates and status".to_string();
         }
         let shown = self.visible().len();
         let hidden = self.hidden_count();
