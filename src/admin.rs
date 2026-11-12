@@ -225,6 +225,7 @@ pub struct Paths {
     pub rules: PathBuf,
     pub build_dir: PathBuf,
     pub backup_root: PathBuf,
+    pub eve_dir: PathBuf,
     pub lock: PathBuf,
     pub log: PathBuf,
     pub suricata_update: String,
@@ -241,6 +242,7 @@ impl Paths {
             // a symlink that the root helper would write through.
             build_dir: "/var/db/suritui-build".into(),
             backup_root: "/var/backups/suritui".into(),
+            eve_dir: "/var/log/suricata".into(),
             lock: "/var/run/suritui-admin.lock".into(),
             log: "/var/log/suritui-admin.log".into(),
             suricata_update: "/usr/local/bin/suricata-update".into(),
@@ -529,6 +531,77 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
     Ok(rep)
 }
 
+/// Why a read verb failed. `NoSuchDay` maps to exit code 3 for the TUI.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadError {
+    NoSuchDay,
+    Other(String),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::NoSuchDay => write!(f, "no alert log for that day"),
+            ReadError::Other(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+fn open_plain(path: &Path) -> Result<fs::File, ReadError> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Err(ReadError::Other(format!("{} is not a regular file; refusing", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ReadError::NoSuchDay),
+        Err(e) => return Err(ReadError::Other(io("cannot stat the log", e))),
+    }
+    fs::File::open(path).map_err(|e| ReadError::Other(io("cannot open", e)))
+}
+
+const ALERT_MARK: &[u8] = b"\"event_type\":\"alert\"";
+
+fn has_alert_mark(line: &[u8]) -> bool {
+    line.windows(ALERT_MARK.len()).any(|w| w == ALERT_MARK)
+}
+
+fn copy_alert_lines<R: std::io::Read, W: std::io::Write>(r: R, w: &mut W) -> Result<(), ReadError> {
+    use std::io::BufRead;
+    let mut r = std::io::BufReader::new(r);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = r.read_until(b'\n', &mut line).map_err(|e| ReadError::Other(io("read", e)))?;
+        if n == 0 {
+            return Ok(());
+        }
+        if has_alert_mark(&line) {
+            if !line.ends_with(b"\n") {
+                line.push(b'\n');
+            }
+            w.write_all(&line).map_err(|e| ReadError::Other(io("write", e)))?;
+        }
+    }
+}
+
+/// `alerts live` / `alerts day K`: print the alert events (raw JSON lines).
+pub fn read_alerts<W: std::io::Write>(paths: &Paths, r: crate::source::Range, w: &mut W) -> Result<(), ReadError> {
+    use crate::source::{validate, Range};
+    let r = validate(r).map_err(|_| ReadError::NoSuchDay)?;
+    match r {
+        Range::Today => copy_alert_lines(open_plain(&paths.eve_dir.join("eve.json"))?, w),
+        Range::Day(k) => {
+            let f = open_plain(&paths.eve_dir.join(format!("eve.json.{k}.gz")))?;
+            copy_alert_lines(flate2::read::MultiGzDecoder::new(f), w)
+        }
+    }
+}
+
+/// `rules`: print the live rules file, so the TUI can show what is loaded.
+pub fn read_rules<W: std::io::Write>(paths: &Paths, w: &mut W) -> Result<(), ReadError> {
+    let mut f = open_plain(&paths.rules)?;
+    std::io::copy(&mut f, w).map_err(|e| ReadError::Other(io("read the rules", e)))?;
+    Ok(())
+}
+
 /// Read-only summary for `status`.
 pub fn status(paths: &Paths, runner: &dyn Runner) -> Report {
     let mut rep = Report::default();
@@ -727,6 +800,7 @@ mod tests {
             rules: d.join("suricata.rules"),
             build_dir: d.join("build"),
             backup_root: d.join("backups"),
+            eve_dir: d.join("eve"),
             lock: d.join("lock"),
             log: d.join("log"),
             suricata_update: "su".into(),
@@ -924,5 +998,57 @@ mod tests {
         *f.reloads.borrow_mut() = vec![false, true]; // 2nd reload (popped first... ) fails after restore
         let e = apply(&p, &f, Verb::Disable, 100).unwrap_err();
         assert!(e.contains("previous rules are back"), "{e}");
+    }
+
+    // ---- read verbs ----
+
+    fn gz(text: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(text.as_bytes()).unwrap();
+        e.finish().unwrap()
+    }
+
+    const EVE: &str = "{\"event_type\":\"flow\",\"x\":1}\n{\"timestamp\":\"t\",\"event_type\":\"alert\",\"a\":1}\n{\"event_type\":\"dns\"}\n{\"event_type\":\"alert\",\"b\":2}";
+
+    #[test]
+    fn alerts_live_prints_only_alert_lines() {
+        let (_t, p) = setup("eve-live", "", "");
+        fs::create_dir_all(&p.eve_dir).unwrap();
+        fs::write(p.eve_dir.join("eve.json"), EVE).unwrap();
+        let mut out = Vec::new();
+        read_alerts(&p, crate::source::Range::Today, &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s.lines().count(), 2, "{s}");
+        assert!(s.lines().all(|l| l.contains("\"event_type\":\"alert\"")));
+        assert!(s.ends_with('\n'));
+    }
+
+    #[test]
+    fn alerts_day_reads_gzip_and_reports_missing_days() {
+        let (_t, p) = setup("eve-day", "", "");
+        fs::create_dir_all(&p.eve_dir).unwrap();
+        fs::write(p.eve_dir.join("eve.json.3.gz"), gz(EVE)).unwrap();
+        let mut out = Vec::new();
+        read_alerts(&p, crate::source::Range::Day(3), &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap().lines().count(), 2);
+        let e = read_alerts(&p, crate::source::Range::Day(4), &mut Vec::new()).unwrap_err();
+        assert_eq!(e, ReadError::NoSuchDay);
+        let e = read_alerts(&p, crate::source::Range::Day(14), &mut Vec::new()).unwrap_err();
+        assert_eq!(e, ReadError::NoSuchDay);
+    }
+
+    #[test]
+    fn read_verbs_refuse_symlinked_logs_and_print_the_rules() {
+        let (t, p) = setup("eve-link", &rules(&[R_ON]), "");
+        fs::create_dir_all(&p.eve_dir).unwrap();
+        let secret = t.0.join("secret");
+        fs::write(&secret, EVE).unwrap();
+        std::os::unix::fs::symlink(&secret, p.eve_dir.join("eve.json")).unwrap();
+        let e = read_alerts(&p, crate::source::Range::Today, &mut Vec::new()).unwrap_err();
+        assert!(matches!(e, ReadError::Other(m) if m.contains("not a regular file")));
+        let mut out = Vec::new();
+        read_rules(&p, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), rules(&[R_ON]));
     }
 }

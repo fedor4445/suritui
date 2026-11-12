@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-pub const HELPER: &str = "/usr/local/sbin/suritui-admin";
+pub use crate::local::HELPER;
 
 /// What the user is being asked to confirm.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,29 +7,23 @@ use crate::source::{map_output, validate, AlertSource, Loaded, Range, SourceErro
 use std::collections::HashSet;
 use std::process::Command;
 
-pub const EVE_DIR: &str = "/var/log/suricata";
-pub const RULES_FILE: &str = "/var/lib/suricata/rules/suricata.rules";
 pub const DISABLE_CONF: &str = "/usr/local/etc/suricata/disable.conf";
 
-/// The shell snippet that prints the alert events of one range. The only
-/// interpolated value is a day number that `validate` has bounded to 0..=13.
-pub fn alert_script(r: Range) -> String {
-    let filter = "grep -a '\"event_type\":\"alert\"'";
-    match r {
-        Range::Today => format!("{filter} {EVE_DIR}/eve.json; [ $? -le 1 ]"),
-        Range::Day(k) => format!(
-            "f={EVE_DIR}/eve.json.{k}.gz; [ -r \"$f\" ] || exit 3; zcat \"$f\" | {filter}; [ $? -le 1 ]"
-        ),
-    }
-}
+/// The privileged helper; local mode never runs anything else through sudo.
+pub const HELPER: &str = "/usr/local/sbin/suritui-admin";
 
 pub struct LocalSource;
 
 impl AlertSource for LocalSource {
     fn load(&self, r: Range) -> Result<Loaded, SourceError> {
         let r = validate(r)?;
+        let mut args = vec!["-n".to_string(), HELPER.to_string(), "alerts".to_string()];
+        match r {
+            Range::Today => args.push("live".to_string()),
+            Range::Day(k) => args.extend(["day".to_string(), k.to_string()]),
+        }
         let out = Command::new("sudo")
-            .args(["-n", "sh", "-c", &alert_script(r)])
+            .args(&args)
             .output()
             .map_err(|e| SourceError::Ssh(format!("cannot run sudo: {e}")))?;
         map_output(out.status.code(), &out.stdout, &out.stderr)
@@ -58,7 +52,7 @@ fn sudo_output(args: &[&str]) -> Result<Vec<u8>, String> {
 
 /// The rules Suricata actually loads, as merged by suricata-update.
 pub fn load_rule_index() -> Result<RuleIndex, String> {
-    let bytes = sudo_output(&["cat", RULES_FILE])?;
+    let bytes = sudo_output(&[HELPER, "rules"])?;
     Ok(RuleIndex::from_text(&String::from_utf8_lossy(&bytes)))
 }
 
@@ -158,26 +152,6 @@ pub fn catalog(idx: &RuleIndex) -> Vec<CatalogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn today_script_has_no_interpolation() {
-        let s = alert_script(Range::Today);
-        assert!(s.contains("/var/log/suricata/eve.json;"));
-        assert!(s.contains("event_type"));
-    }
-
-    #[test]
-    fn day_script_uses_the_number_only() {
-        let s = alert_script(Range::Day(13));
-        assert!(s.contains("eve.json.13.gz"));
-        assert!(s.contains("exit 3"));
-    }
-
-    #[test]
-    fn out_of_range_day_never_reaches_sudo() {
-        // validate() is applied before the command is built.
-        assert!(validate(Range::Day(14)).is_err());
-    }
 
     #[test]
     fn parses_disable_conf_forms() {

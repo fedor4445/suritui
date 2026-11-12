@@ -1,16 +1,19 @@
 //! suritui-admin: the only privileged piece of suritui. Run through sudo.
 //!
 //!   suritui-admin status
+//!   suritui-admin rules
+//!   suritui-admin alerts live | day K
 //!   suritui-admin disable SID
 //!   suritui-admin enable SID
 //!
 //! Nothing else is accepted: no options, no paths, no free text.
 
 use std::process::ExitCode;
-use suritui::admin::{apply, parse_sid, status, Paths, SystemRunner, Verb};
+use suritui::admin::{apply, parse_sid, read_alerts, read_rules, status, Paths, ReadError, SystemRunner, Verb};
+use suritui::source::Range;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: suritui-admin status | disable SID | enable SID");
+    eprintln!("usage: suritui-admin status | rules | alerts live | alerts day K | disable SID | enable SID");
     ExitCode::from(2)
 }
 
@@ -18,6 +21,28 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let paths = Paths::production();
     let runner = SystemRunner;
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    // The read verbs stream to stdout and use their own exit codes
+    // (3 = no log for that day), so they are handled before the change verbs.
+    let read = match words.as_slice() {
+        ["rules"] => Some(read_rules(&paths, &mut std::io::stdout().lock())),
+        ["alerts", "live"] => Some(read_alerts(&paths, Range::Today, &mut std::io::stdout().lock())),
+        ["alerts", "day", k] if k.len() <= 2 && k.bytes().all(|b| b.is_ascii_digit()) => {
+            let k: u8 = k.parse().unwrap_or(255);
+            Some(read_alerts(&paths, Range::Day(k), &mut std::io::stdout().lock()))
+        }
+        _ => None,
+    };
+    if let Some(r) = read {
+        return match r {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(ReadError::NoSuchDay) => ExitCode::from(3),
+            Err(e) => {
+                eprintln!("suritui-admin: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["status"] => Ok(status(&paths, &runner)),
         [verb @ ("disable" | "enable"), sid] => {
