@@ -54,8 +54,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (Mode::List, KeyCode::Char('?')) => app.set_mode(Mode::Help),
         (Mode::List, KeyCode::Char('2')) => app.open_rules(),
         (Mode::List, KeyCode::Char('3')) => app.open_sources(),
-        (Mode::List | Mode::Rules | Mode::Sources | Mode::Updates, KeyCode::Char('4')) => app.open_updates(),
-        (Mode::List | Mode::Rules | Mode::Sources | Mode::Updates, KeyCode::Char('5')) => app.open_thresholds(),
+        (Mode::List | Mode::Rules | Mode::Sources | Mode::Updates | Mode::Settings | Mode::Logs, KeyCode::Char('4')) => {
+            app.open_updates()
+        }
+        (Mode::List | Mode::Rules | Mode::Sources | Mode::Updates | Mode::Thresholds | Mode::Settings | Mode::Logs, KeyCode::Char('6')) => {
+            app.open_settings()
+        }
+        (Mode::List | Mode::Rules | Mode::Sources | Mode::Updates | Mode::Thresholds | Mode::Settings | Mode::Logs, KeyCode::Char('7')) => {
+            app.open_logs()
+        }
+        (Mode::Settings | Mode::Logs, KeyCode::Char('1')) => app.set_mode(Mode::List),
+        (Mode::Settings | Mode::Logs, KeyCode::Char('2')) => app.open_rules(),
+        (Mode::Settings, KeyCode::Char('R')) => app.reload_settings(),
+        (Mode::Logs, KeyCode::Char('R')) => {
+            app.load_logs();
+            app.scroll_to_bottom();
+        }
+        (Mode::Logs, KeyCode::Tab) => app.next_log(),
+        (Mode::List | Mode::Rules | Mode::Sources | Mode::Updates | Mode::Settings | Mode::Logs, KeyCode::Char('5')) => app.open_thresholds(),
         (Mode::Thresholds, KeyCode::Char('1')) => app.set_mode(Mode::List),
         (Mode::Thresholds, KeyCode::Char('2')) => app.open_rules(),
         (Mode::Thresholds, KeyCode::Char('4')) => app.open_updates(),
@@ -89,7 +105,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (m, KeyCode::Char('G') | KeyCode::End) if m.scrolls() => app.scroll_to_bottom(),
         (Mode::Detail, KeyCode::Char('r')) => app.set_mode(Mode::Rule),
         (Mode::Detail, KeyCode::Char('w')) => app.set_mode(Mode::Raw),
-        (Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help | Mode::Sources | Mode::Updates | Mode::Thresholds, KeyCode::Esc) => {
+        (Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help | Mode::Sources | Mode::Updates | Mode::Thresholds | Mode::Settings | Mode::Logs, KeyCode::Esc) => {
             app.set_mode(Mode::List)
         }
         (Mode::RuleInfo, KeyCode::Esc) => app.set_mode(Mode::Rules),

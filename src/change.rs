@@ -54,6 +54,14 @@ pub trait Admin: Send + Sync {
     fn thresholds(&self) -> Vec<ThresholdEntry> {
         Vec::new()
     }
+    /// Lines of the read-only Settings screen.
+    fn settings(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The tail of one log (`suricata`, `update` or `admin`).
+    fn log(&self, _name: &str) -> Result<Vec<String>, String> {
+        Err("logs are not available here".to_string())
+    }
     fn run(&self, a: &Action) -> Result<Vec<String>, String> {
         match a {
             Action::Rule(v, sid) => self.change(*v, *sid),
@@ -108,6 +116,17 @@ impl Admin for LocalAdmin {
 
     fn suppress(&self, add: bool, sid: u64, track: Track, ip: &str) -> Result<Vec<String>, String> {
         run_helper(&[if add { "suppress" } else { "unsuppress" }, &sid.to_string(), track.word(), ip])
+    }
+
+    fn settings(&self) -> Vec<String> {
+        match std::fs::read_to_string(crate::local::SURICATA_YAML) {
+            Ok(t) => crate::settings::summarize(crate::local::SURICATA_YAML, &t),
+            Err(e) => vec![format!("Cannot read {}: {e}", crate::local::SURICATA_YAML)],
+        }
+    }
+
+    fn log(&self, name: &str) -> Result<Vec<String>, String> {
+        run_helper(&["log", name])
     }
 
     fn thresholds(&self) -> Vec<ThresholdEntry> {

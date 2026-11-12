@@ -38,6 +38,10 @@ pub enum Mode {
     Updates,
     /// Suppress entries (threshold.config).
     Thresholds,
+    /// Read-only summary of suricata.yaml.
+    Settings,
+    /// Tail of the Suricata, update and helper logs.
+    Logs,
     /// The helper has finished.
     Done,
 }
@@ -56,6 +60,8 @@ impl Mode {
                 | Mode::Confirm
                 | Mode::Done
                 | Mode::Updates
+                | Mode::Settings
+                | Mode::Logs
         )
     }
 }
@@ -103,6 +109,9 @@ pub struct App {
     pub updates: Option<Vec<String>>,
     pub thresholds: Vec<ThresholdEntry>,
     pub thr_sel: usize,
+    pub settings: Option<Vec<String>>,
+    pub logs: Vec<String>,
+    pub log_idx: usize,
     after_done: Mode,
     cache: HashMap<Range, Loaded>,
     pub mode: Mode,
@@ -145,6 +154,9 @@ impl App {
             updates: None,
             thresholds: Vec::new(),
             thr_sel: 0,
+            settings: None,
+            logs: Vec::new(),
+            log_idx: 0,
             after_done: Mode::Rules,
             cache: HashMap::new(),
             mode: Mode::List,
@@ -486,6 +498,58 @@ impl App {
         self.updates = Some(admin.info().unwrap_or_else(|e| vec![format!("Could not read the status: {e}")]));
     }
 
+    /// Open the read-only Settings screen (router only).
+    pub fn open_settings(&mut self) {
+        let Some(admin) = &self.admin else {
+            self.status = "settings are only available on the router (use --local)".to_string();
+            return;
+        };
+        self.settings = Some(admin.settings());
+        self.status.clear();
+        self.set_mode(Mode::Settings);
+    }
+
+    pub fn reload_settings(&mut self) {
+        if let Some(a) = &self.admin {
+            self.settings = Some(a.settings());
+        }
+    }
+
+    pub const LOG_NAMES: [&'static str; 3] = ["suricata", "update", "admin"];
+
+    pub fn log_name(&self) -> &'static str {
+        Self::LOG_NAMES[self.log_idx % Self::LOG_NAMES.len()]
+    }
+
+    /// Open the log viewer, positioned at the end of the log.
+    pub fn open_logs(&mut self) {
+        if self.admin.is_none() {
+            self.status = "logs are only available on the router (use --local)".to_string();
+            return;
+        }
+        self.status.clear();
+        self.load_logs();
+        self.set_mode(Mode::Logs);
+        self.scroll.top = usize::MAX; // clamped to the end when drawn
+    }
+
+    pub fn next_log(&mut self) {
+        self.log_idx = (self.log_idx + 1) % Self::LOG_NAMES.len();
+        self.load_logs();
+        self.set_mode(Mode::Logs);
+        self.scroll.top = usize::MAX;
+    }
+
+    pub fn load_logs(&mut self) {
+        let name = self.log_name();
+        let Some(a) = &self.admin else { return };
+        self.logs = match a.log(name) {
+            Ok(l) if l.is_empty() => vec![format!("The {name} log is empty.")],
+            Ok(l) => l,
+            Err(e) => vec![format!("Cannot read the {name} log: {e}")],
+        };
+    }
+
     /// Open the suppress list (router only).
     pub fn open_thresholds(&mut self) {
         if self.admin.is_none() {
@@ -809,6 +873,12 @@ impl App {
         }
         if self.mode == Mode::Thresholds {
             return format!("{} entries", self.thresholds.len());
+        }
+        if self.mode == Mode::Settings {
+            return "settings".to_string();
+        }
+        if self.mode == Mode::Logs {
+            return format!("{} log, {} lines", self.log_name(), self.logs.len());
         }
         let shown = self.visible().len();
         let hidden = self.hidden_count();

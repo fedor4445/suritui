@@ -85,12 +85,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Sources => draw_sources(f, app, body),
         Mode::Updates => draw_updates(f, app, body),
         Mode::Thresholds => draw_thresholds(f, app, body),
+        Mode::Settings => draw_settings(f, app, body),
+        Mode::Logs => draw_logs(f, app, body),
         Mode::Confirm => draw_confirm(f, app, body),
         Mode::Working => draw_working(f, app, body),
         Mode::Done => draw_done(f, app, body),
     }
     let hint = match app.mode {
-        Mode::List => "  ? help   2 rules   3 sources   4 updates   5 suppress",
+        Mode::List => "  ? help  2 rules  3 sources  4 updates  5 suppress  6 settings  7 logs",
         Mode::Detail if app.can_change() => "  Esc back   r rule   w raw   d disable rule   s silence src   S silence dest",
         Mode::Detail => "  Esc back   r rule text   w raw JSON",
         Mode::Rule if app.can_change() => "  Esc back   d disable rule   s silence src   S silence dest",
@@ -103,6 +105,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Updates if app.can_change() => "  U update now   R reload   1 alerts   2 rules   3 sources",
         Mode::Updates => "  R reload   1 alerts   2 rules   3 sources",
         Mode::Thresholds => "  x remove   R reload   1 alerts   2 rules   4 updates",
+        Mode::Settings => "  R reload   1 alerts   2 rules   4 updates   7 logs",
+        Mode::Logs => "  Tab next log   R reload   G end   1 alerts   6 settings",
         Mode::Confirm => "  y confirm   Esc cancel",
         Mode::Working => "  working: do not close this window",
         Mode::Done => "  Enter continue",
@@ -600,6 +604,25 @@ fn draw_thresholds(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
+    let lines: Vec<Line<'static>> = match &app.settings {
+        Some(l) => l.iter().map(|t| plain(t)).collect(),
+        None => vec![Line::from("Not loaded.")],
+    };
+    scroll_screen(f, app, area, "Settings (suricata.yaml, read-only)", lines);
+}
+
+fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
+    let lines: Vec<Line<'static>> = app.logs.iter().map(|t| plain(t)).collect();
+    let title = format!(
+        "Log: {} ({} of {}, newest at the bottom)   Tab: next log",
+        app.log_name(),
+        app.log_idx % App::LOG_NAMES.len() + 1,
+        App::LOG_NAMES.len()
+    );
+    scroll_screen(f, app, area, &title, lines);
+}
+
 fn draw_updates(f: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line<'static>> = match &app.updates {
         Some(l) => l.iter().map(|t| plain(t)).collect(),
@@ -715,6 +738,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("U", "updates screen: update the rules now (router)"),
         ("s / S", "alert screens: silence the rule for this source / destination"),
         ("5, x", "suppress list; x removes the highlighted entry"),
+        ("6 / 7", "settings (read-only) / logs (Tab: next log)"),
         ("d / e", "disable / enable a rule: rules list, rule screen; d on an alert (router)"),
         ("y", "confirm a change (Esc cancels)"),
         ("/ s c", "rules: search / state filter / clear"),
@@ -2154,5 +2178,101 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         a.mode = Mode::Help;
         let s = screen(&a, 110, 44);
         assert!(s.contains("silence the rule") && s.contains("suppress list"), "{s}");
+    }
+
+    // ---- settings and logs ----
+
+    struct FakeLogs {
+        bodies: Vec<(&'static str, Result<Vec<String>, String>)>,
+    }
+
+    impl Admin for FakeLogs {
+        fn available(&self) -> bool {
+            true
+        }
+        fn change(&self, _v: Verb, _sid: u64) -> Result<Vec<String>, String> {
+            Ok(vec![])
+        }
+        fn settings(&self) -> Vec<String> {
+            vec!["Config file: /x/suricata.yaml   (read-only: edit it by hand)".into(), "  HOME_NET      [10.0.0.0/8]".into()]
+        }
+        fn log(&self, name: &str) -> Result<Vec<String>, String> {
+            self.bodies.iter().find(|(n, _)| *n == name).map(|(_, r)| r.clone()).unwrap()
+        }
+        fn reload(&self) -> Result<(RuleIndex, DisableConf), String> {
+            Ok((RuleIndex::from_text(RULES), DisableConf::default()))
+        }
+    }
+
+    fn logs_app() -> App {
+        let long: Vec<String> = (0..100).map(|i| format!("suricata log line {i}")).collect();
+        let mut a = app(vec![]);
+        a.set_admin(Arc::new(FakeLogs {
+            bodies: vec![("suricata", Ok(long)), ("update", Ok(vec![])), ("admin", Err("permission denied".into()))],
+        }));
+        a
+    }
+
+    #[test]
+    fn six_shows_the_read_only_settings() {
+        let mut a = logs_app();
+        key(&mut a, '6');
+        assert_eq!(a.mode, Mode::Settings);
+        let s = screen(&a, 100, 8);
+        assert!(s.contains("Settings (suricata.yaml, read-only)") && s.contains("HOME_NET      [10.0.0.0/8]"), "{s}");
+        key(&mut a, '1');
+        assert_eq!(a.mode, Mode::List);
+        let mut b = app(vec![]);
+        key(&mut b, '6');
+        assert_eq!(b.mode, Mode::List);
+        assert!(b.status.contains("--local"), "{}", b.status);
+    }
+
+    #[test]
+    fn seven_opens_the_log_at_its_end_and_tab_cycles() {
+        let mut a = logs_app();
+        key(&mut a, '7');
+        assert_eq!(a.mode, Mode::Logs);
+        let s = screen(&a, 100, 8);
+        assert!(s.contains("Log: suricata (1 of 3") && s.contains("suricata log line 99"), "{s}");
+        assert!(!s.contains("suricata log line 0\n"), "{s}");
+        assert!(footer(&a, 100, 8).contains("lines"), "scroll indicator shows the position");
+        key(&mut a, 'g');
+        assert!(screen(&a, 100, 8).contains("suricata log line 0"));
+        press(&mut a, KeyCode::Tab);
+        assert!(screen(&a, 100, 8).contains("Log: update (2 of 3") && screen(&a, 100, 8).contains("The update log is empty."));
+        press(&mut a, KeyCode::Tab);
+        assert!(screen(&a, 100, 8).contains("Cannot read the admin log: permission denied"));
+        press(&mut a, KeyCode::Tab);
+        assert!(screen(&a, 100, 8).contains("Log: suricata (1 of 3"));
+        key(&mut a, '6');
+        assert_eq!(a.mode, Mode::Settings);
+        key(&mut a, '7');
+        assert_eq!(a.mode, Mode::Logs);
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn log_text_is_cleaned_of_terminal_escapes() {
+        let mut a = app(vec![]);
+        a.set_admin(Arc::new(FakeLogs {
+            bodies: vec![
+                ("suricata", Ok(vec!["evil \u{1b}[31mred\u{1b}[0m text".to_string()])),
+                ("update", Ok(vec![])),
+                ("admin", Ok(vec![])),
+            ],
+        }));
+        key(&mut a, '7');
+        let s = screen(&a, 100, 6);
+        assert!(!s.contains('\u{1b}'), "{s:?}");
+    }
+
+    #[test]
+    fn help_lists_settings_and_logs() {
+        let mut a = sample();
+        a.mode = Mode::Help;
+        let s = screen(&a, 110, 50);
+        assert!(s.contains("settings (read-only) / logs"), "{s}");
     }
 }

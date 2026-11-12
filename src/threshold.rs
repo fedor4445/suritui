@@ -365,6 +365,7 @@ mod tests {
             backup_root: d.join("backups"),
             cache_dir: d.join("cache"),
             update_log: d.join("update.log"),
+            suricata_log: d.join("suricata.log"),
             eve_dir: d.join("eve"),
             lock: d.join("lock"),
             log: d.join("log"),

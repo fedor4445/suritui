@@ -282,6 +282,7 @@ pub struct Paths {
     pub backup_root: PathBuf,
     pub cache_dir: PathBuf,
     pub update_log: PathBuf,
+    pub suricata_log: PathBuf,
     pub eve_dir: PathBuf,
     pub lock: PathBuf,
     pub log: PathBuf,
@@ -305,6 +306,7 @@ impl Paths {
             backup_root: "/var/backups/suritui".into(),
             cache_dir: "/var/lib/suricata/update/cache".into(),
             update_log: "/var/log/suricata/update.log".into(),
+            suricata_log: "/var/log/suricata/suricata.log".into(),
             eve_dir: "/var/log/suricata".into(),
             lock: "/var/run/suritui-admin.lock".into(),
             log: "/var/log/suritui-admin.log".into(),
@@ -734,6 +736,45 @@ pub fn read_alerts<W: std::io::Write>(paths: &Paths, r: crate::source::Range, w:
     }
 }
 
+/// How much of the end of a log is shown.
+pub const LOG_TAIL_BYTES: u64 = 96 * 1024;
+pub const LOG_TAIL_LINES: usize = 400;
+
+/// Which log `suritui-admin log NAME` may print.
+pub fn log_path<'a>(paths: &'a Paths, name: &str) -> Option<&'a Path> {
+    match name {
+        "suricata" => Some(&paths.suricata_log),
+        "update" => Some(&paths.update_log),
+        "admin" => Some(&paths.log),
+        _ => None,
+    }
+}
+
+/// `log NAME`: the last lines of one of three fixed logs.
+pub fn read_log<W: std::io::Write>(paths: &Paths, name: &str, w: &mut W) -> Result<(), ReadError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = log_path(paths, name).ok_or_else(|| ReadError::Other("unknown log (suricata | update | admin)".into()))?;
+    let mut f = open_plain(path)?;
+    let len = f.metadata().map_err(|e| ReadError::Other(io("stat", e)))?.len();
+    let from = len.saturating_sub(LOG_TAIL_BYTES);
+    f.seek(SeekFrom::Start(from)).map_err(|e| ReadError::Other(io("seek", e)))?;
+    let mut buf = Vec::new();
+    f.take(LOG_TAIL_BYTES).read_to_end(&mut buf).map_err(|e| ReadError::Other(io("read", e)))?;
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if from > 0 {
+        // The first line is probably cut in half.
+        if let Some(i) = text.find('\n') {
+            text.drain(..=i);
+        }
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(LOG_TAIL_LINES);
+    for l in &lines[start..] {
+        writeln!(w, "{l}").map_err(|e| ReadError::Other(io("write", e)))?;
+    }
+    Ok(())
+}
+
 /// `rules`: print the live rules file, so the TUI can show what is loaded.
 pub fn read_rules<W: std::io::Write>(paths: &Paths, w: &mut W) -> Result<(), ReadError> {
     let mut f = open_plain(&paths.rules)?;
@@ -996,6 +1037,7 @@ mod tests {
             backup_root: d.join("backups"),
             cache_dir: d.join("cache"),
             update_log: d.join("update.log"),
+            suricata_log: d.join("suricata.log"),
             eve_dir: d.join("eve"),
             lock: d.join("lock"),
             log: d.join("log"),
@@ -1309,5 +1351,45 @@ mod tests {
         let b = fs::read_dir(&p.backup_root).unwrap().next().unwrap().unwrap().path();
         assert_eq!(fs::read_to_string(b.join("enable.conf")).unwrap(), "77\n");
         assert_eq!(fs::read_to_string(&p.enable_conf).unwrap(), "77\n");
+    }
+
+    #[test]
+    fn logs_show_only_the_tail_of_three_fixed_files() {
+        let (_t, p) = setup("logs", "", "");
+        let mut text = String::new();
+        for i in 0..1000 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        fs::write(&p.suricata_log, &text).unwrap();
+        let mut out = Vec::new();
+        read_log(&p, "suricata", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s.lines().count(), LOG_TAIL_LINES);
+        assert!(s.ends_with("line 999\n") && s.starts_with("line 600\n"), "{}", &s[..30]);
+        assert!(read_log(&p, "../etc/passwd", &mut Vec::new()).is_err());
+        assert_eq!(read_log(&p, "update", &mut Vec::new()).unwrap_err(), ReadError::NoSuchDay);
+    }
+
+    #[test]
+    fn a_huge_log_is_read_from_the_end_without_a_cut_first_line() {
+        let (_t, p) = setup("biglog", "", "");
+        let mut text = String::new();
+        for i in 0..40_000 {
+            text.push_str(&format!("a fairly long log line number {i}\n"));
+        }
+        fs::write(&p.log, &text).unwrap();
+        let mut out = Vec::new();
+        read_log(&p, "admin", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.lines().next().unwrap().starts_with("a fairly long log line number "), "first line must be whole");
+        assert!(s.ends_with("number 39999\n"));
+    }
+
+    #[test]
+    fn symlinked_logs_are_refused() {
+        let (t, p) = setup("loglink", "", "");
+        fs::write(t.0.join("secret"), "x\n").unwrap();
+        std::os::unix::fs::symlink(t.0.join("secret"), &p.suricata_log).unwrap();
+        assert!(matches!(read_log(&p, "suricata", &mut Vec::new()), Err(ReadError::Other(m)) if m.contains("not a regular file")));
     }
 }

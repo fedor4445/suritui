@@ -10,6 +10,7 @@ use std::process::Command;
 pub const DISABLE_CONF: &str = "/usr/local/etc/suricata/disable.conf";
 pub const ENABLE_CONF: &str = "/usr/local/etc/suricata/enable.conf";
 pub const THRESHOLD_CONF: &str = "/usr/local/etc/suricata/threshold.config";
+pub const SURICATA_YAML: &str = "/usr/local/etc/suricata/suricata.yaml";
 
 /// The privileged helper; local mode never runs anything else through sudo.
 pub const HELPER: &str = "/usr/local/sbin/suritui-admin";

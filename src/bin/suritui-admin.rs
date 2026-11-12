@@ -5,6 +5,7 @@
 //!   suritui-admin update
 //!   suritui-admin suppress|unsuppress SID by_src|by_dst IP
 //!   suritui-admin rules
+//!   suritui-admin log suricata | update | admin
 //!   suritui-admin alerts live | day K
 //!   suritui-admin disable SID
 //!   suritui-admin enable SID
@@ -12,13 +13,13 @@
 //! Nothing else is accepted: no options, no paths, no free text.
 
 use std::process::ExitCode;
-use suritui::admin::{apply, parse_sid, read_alerts, read_rules, status, Paths, ReadError, SystemRunner, Verb};
+use suritui::admin::{apply, parse_sid, read_alerts, read_log, read_rules, status, Paths, ReadError, SystemRunner, Verb};
 use suritui::threshold::{apply_suppress, Track};
 use suritui::update::{apply_update, info};
 use suritui::source::Range;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: suritui-admin status | info | update | suppress|unsuppress SID by_src|by_dst IP | rules | alerts live | alerts day K | disable SID | enable SID");
+    eprintln!("usage: suritui-admin status | info | log suricata|update|admin | update | suppress|unsuppress SID by_src|by_dst IP | rules | alerts live | alerts day K | disable SID | enable SID");
     ExitCode::from(2)
 }
 
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
     // (3 = no log for that day), so they are handled before the change verbs.
     let read = match words.as_slice() {
         ["rules"] => Some(read_rules(&paths, &mut std::io::stdout().lock())),
+        ["log", name] => Some(read_log(&paths, name, &mut std::io::stdout().lock())),
         ["alerts", "live"] => Some(read_alerts(&paths, Range::Today, &mut std::io::stdout().lock())),
         ["alerts", "day", k] if k.len() <= 2 && k.bytes().all(|b| b.is_ascii_digit()) => {
             let k: u8 = k.parse().unwrap_or(255);

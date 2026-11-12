@@ -153,6 +153,11 @@ pub fn info(paths: &Paths, runner: &dyn Runner) -> Report {
         runner.run("/bin/pgrep", &["-f", p]).map(|o| o.code == Some(0)).unwrap_or(false)
     });
     say(&mut r, format!("Update running now: {}", if busy { "yes" } else { "no" }));
+    if let Ok(o) = runner.run("/bin/ps", &["-axo", "command"]) {
+        if let Some(cmd) = o.stdout.lines().map(str::trim).find(|l| l.starts_with("/usr/local/bin/suricata ") && l.contains(" -c ")) {
+            say(&mut r, format!("Started as: {cmd}"));
+        }
+    }
     let log = update_log_summary(&paths.update_log);
     if !log.is_empty() {
         say(&mut r, "");
@@ -362,6 +367,7 @@ mod tests {
             backup_root: d.join("backups"),
             cache_dir: d.join("cache"),
             update_log: d.join("update.log"),
+            suricata_log: d.join("suricata.log"),
             eve_dir: d.join("eve"),
             lock: d.join("lock"),
             log: d.join("log"),
