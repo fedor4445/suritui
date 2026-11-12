@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod alert;
 pub mod browser;
 pub mod config;

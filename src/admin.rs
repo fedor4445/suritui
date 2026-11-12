@@ -1,0 +1,891 @@
+//! The privileged rule-change logic behind `suritui-admin`.
+//!
+//! Everything that could hurt the router lives here, small and testable: the
+//! input is one verb and one sid, every other value is a fixed path, and a
+//! change only goes live after the rebuilt rules have been checked against the
+//! live ones. IDS (pcap) only: nothing here touches drop/reject rules.
+
+use crate::rules::parse_line;
+use std::collections::HashMap;
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// More flips than this besides the target means something is off.
+pub const MAX_EXTRA_FLIPS: usize = 25;
+/// Backups kept (newest first).
+pub const KEEP_BACKUPS: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Disable,
+    Enable,
+}
+
+impl Verb {
+    pub fn word(self) -> &'static str {
+        match self {
+            Verb::Disable => "disable",
+            Verb::Enable => "enable",
+        }
+    }
+
+    fn wants_enabled(self) -> bool {
+        self == Verb::Enable
+    }
+}
+
+/// A sid is 1 to 10 plain digits, not zero. Nothing else is accepted.
+pub fn parse_sid(s: &str) -> Option<u64> {
+    if s.is_empty() || s.len() > 10 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// The sid a disable.conf line names (`2012345` or `1:2012345`), if it is a
+/// plain sid line. Comments, groups and patterns give None.
+fn line_sid(line: &str) -> Option<u64> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') || t.starts_with("group:") || t.starts_with("re:") {
+        return None;
+    }
+    let first = t.split_whitespace().next()?;
+    parse_sid(first.rsplit(':').next()?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Edit {
+    /// Nothing to write: disable.conf already says it.
+    NoChange(String),
+    /// New file text.
+    Write(String),
+}
+
+/// Build the candidate disable.conf. Pure: no I/O.
+pub fn candidate_disable_conf(text: &str, verb: Verb, sid: u64, date: &str) -> Result<Edit, String> {
+    let listed = text.lines().any(|l| line_sid(l) == Some(sid));
+    match verb {
+        Verb::Disable => {
+            if listed {
+                return Ok(Edit::NoChange(format!(
+                    "sid {sid} is already listed in disable.conf"
+                )));
+            }
+            let mut out = text.to_string();
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!("{sid}  # suritui {date}\n"));
+            Ok(Edit::Write(out))
+        }
+        Verb::Enable => {
+            if !listed {
+                return Err(format!(
+                    "sid {sid} is not listed in disable.conf by number, so removing a line cannot enable it \
+                     (it is disabled by a group or pattern, or off in the rule source)"
+                ));
+            }
+            let mut out = String::new();
+            for line in text.lines() {
+                if line_sid(line) != Some(sid) {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            Ok(Edit::Write(out))
+        }
+    }
+}
+
+fn rule_map(text: &str) -> HashMap<u64, (bool, String)> {
+    let mut m = HashMap::new();
+    for line in text.lines() {
+        if let Some(r) = parse_line(line) {
+            let body = r.text.trim_start_matches('#').trim_start().to_string();
+            m.insert(r.sid, (r.enabled, body));
+        }
+    }
+    m
+}
+
+/// Compare the live rules with the rebuilt candidate. Ok(other sids whose state
+/// also flipped, sorted) when the only differences are the target's state and a
+/// few flowbit dependents; Err(reason) for anything else.
+pub fn check_rule_diff(live: &str, cand: &str, sid: u64, verb: Verb) -> Result<Vec<u64>, String> {
+    let (l, c) = (rule_map(live), rule_map(cand));
+    if l.is_empty() {
+        return Err("the live rules file has no rules; refusing to continue".into());
+    }
+    let added = c.keys().filter(|k| !l.contains_key(k)).count();
+    let removed = l.keys().filter(|k| !c.contains_key(k)).count();
+    if added > 0 || removed > 0 {
+        return Err(format!(
+            "the rebuilt rules add {added} and remove {removed} rules; the cache is not what produced the live \
+             rules. Run the daily update first"
+        ));
+    }
+    let mut flips = Vec::new();
+    let mut text_changed = 0;
+    for (k, (le, lb)) in &l {
+        let (ce, cb) = &c[k];
+        if lb != cb {
+            text_changed += 1;
+        }
+        if le != ce {
+            flips.push(*k);
+        }
+    }
+    if text_changed > 0 {
+        return Err(format!(
+            "{text_changed} rules changed text; the cache is not what produced the live rules. Run the daily update first"
+        ));
+    }
+    let Some((live_state, _)) = l.get(&sid) else {
+        return Err(format!("sid {sid} is not in the live rules"));
+    };
+    let want = verb.wants_enabled();
+    let cand_state = c[&sid].0;
+    if cand_state != want {
+        return Err(format!(
+            "after the rebuild sid {sid} is still {} (a rule that other enabled rules depend on through flowbits \
+             cannot be turned off this way)",
+            if cand_state { "enabled" } else { "disabled" }
+        ));
+    }
+    if *live_state == want && flips.contains(&sid) {
+        return Err("internal inconsistency in the diff".into());
+    }
+    let mut extra: Vec<u64> = flips.into_iter().filter(|k| *k != sid).collect();
+    extra.sort_unstable();
+    if extra.len() > MAX_EXTRA_FLIPS {
+        return Err(format!(
+            "{} other rules would change state (limit {MAX_EXTRA_FLIPS}); refusing",
+            extra.len()
+        ));
+    }
+    Ok(extra)
+}
+
+/// `YYYY-MM-DD` of a unix time (UTC), without a date library.
+pub fn ymd(secs: u64) -> String {
+    let z = (secs / 86400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+// ------------------------------------------------------------ running things
+
+pub struct Out {
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Runs the few external programs. Fixed program paths and arguments only.
+pub trait Runner {
+    fn run(&self, prog: &str, args: &[&str]) -> Result<Out, String>;
+}
+
+pub struct SystemRunner;
+
+impl Runner for SystemRunner {
+    fn run(&self, prog: &str, args: &[&str]) -> Result<Out, String> {
+        let out = Command::new(prog)
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin")
+            .env("LANG", "C")
+            .output()
+            .map_err(|e| format!("cannot run {prog}: {e}"))?;
+        Ok(Out {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+}
+
+/// Every path and program the helper touches. Production values are constants;
+/// tests build their own under a temp dir.
+#[derive(Debug, Clone)]
+pub struct Paths {
+    pub disable_conf: PathBuf,
+    pub rules: PathBuf,
+    pub build_dir: PathBuf,
+    pub backup_root: PathBuf,
+    pub lock: PathBuf,
+    pub log: PathBuf,
+    pub suricata_update: String,
+    pub suricatasc: String,
+    pub require_root: bool,
+}
+
+impl Paths {
+    pub fn production() -> Paths {
+        Paths {
+            disable_conf: "/usr/local/etc/suricata/disable.conf".into(),
+            rules: "/var/lib/suricata/rules/suricata.rules".into(),
+            // Root-only parents: the suricata user must never be able to plant
+            // a symlink that the root helper would write through.
+            build_dir: "/var/db/suritui-build".into(),
+            backup_root: "/var/backups/suritui".into(),
+            lock: "/var/run/suritui-admin.lock".into(),
+            log: "/var/log/suritui-admin.log".into(),
+            suricata_update: "/usr/local/bin/suricata-update".into(),
+            suricatasc: "/usr/local/bin/suricatasc".into(),
+            require_root: true,
+        }
+    }
+}
+
+fn io(what: &str, e: std::io::Error) -> String {
+    format!("{what}: {e}")
+}
+
+struct Lock(PathBuf);
+
+impl Lock {
+    fn take(path: &Path, runner: &dyn Runner) -> Result<Lock, String> {
+        for attempt in 0..2 {
+            match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", std::process::id());
+                    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+                    return Ok(Lock(path.to_path_buf()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                    let pid = fs::read_to_string(path).unwrap_or_default();
+                    let pid = pid.trim();
+                    let alive = parse_sid(pid).is_some_and(|p| {
+                        runner
+                            .run("/bin/ps", &["-p", &p.to_string()])
+                            .map(|o| o.code == Some(0))
+                            .unwrap_or(true)
+                    });
+                    if alive {
+                        return Err("another suritui-admin run is active".into());
+                    }
+                    let _ = fs::remove_file(path); // stale: its owner is gone
+                }
+                Err(e) => return Err(io("cannot take the lock", e)),
+            }
+        }
+        Err("cannot take the lock".into())
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Write `data` to `path` the safe way for a directory another user can write
+/// to: a fresh staging file created with O_EXCL (never through a symlink), owner
+/// and mode set on the open file, then an atomic rename over `path`.
+fn put(path: &Path, data: &[u8], like: &fs::Metadata) -> Result<(), String> {
+    use std::io::Write;
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".suritui-new");
+    let stage = PathBuf::from(name);
+    match fs::remove_file(&stage) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io("clear the staging file", e)),
+    }
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode_0600()
+        .open(&stage)
+        .map_err(|e| io("create the staging file", e))?;
+    let r = (|| -> Result<(), String> {
+        f.write_all(data).map_err(|e| io("write", e))?;
+        std::os::unix::fs::fchown(&f, Some(like.uid()), Some(like.gid())).map_err(|e| io("chown", e))?;
+        f.set_permissions(fs::Permissions::from_mode(like.mode() & 0o7777)).map_err(|e| io("chmod", e))?;
+        f.sync_all().map_err(|e| io("sync", e))
+    })();
+    if let Err(e) = r {
+        let _ = fs::remove_file(&stage);
+        return Err(e);
+    }
+    fs::rename(&stage, path).map_err(|e| {
+        let _ = fs::remove_file(&stage);
+        io("rename into place", e)
+    })
+}
+
+/// A live file must be a plain file, not a symlink or anything else.
+fn plain_file(path: &Path) -> Result<fs::Metadata, String> {
+    let m = fs::symlink_metadata(path).map_err(|e| io(&format!("cannot stat {}", path.display()), e))?;
+    if !m.file_type().is_file() {
+        return Err(format!("{} is not a regular file; refusing", path.display()));
+    }
+    Ok(m)
+}
+
+trait Mode600 {
+    fn mode_0600(&mut self) -> &mut Self;
+}
+
+impl Mode600 for fs::OpenOptions {
+    fn mode_0600(&mut self) -> &mut Self {
+        std::os::unix::fs::OpenOptionsExt::mode(self, 0o600)
+    }
+}
+
+fn prune_backups(root: &Path) {
+    let Ok(rd) = fs::read_dir(root) else { return };
+    let mut dirs: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect();
+    dirs.sort();
+    while dirs.len() > KEEP_BACKUPS {
+        let _ = fs::remove_dir_all(dirs.remove(0));
+    }
+}
+
+/// What a finished change tells the user.
+#[derive(Debug, Default)]
+pub struct Report {
+    pub lines: Vec<String>,
+}
+
+fn say(r: &mut Report, s: impl Into<String>) {
+    r.lines.push(s.into());
+}
+
+fn log_line(paths: &Paths, runner: &dyn Runner, msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&paths.log) {
+        let _ = writeln!(f, "{} {msg}", ymd(now()));
+    }
+    let _ = runner.run("/usr/bin/logger", &["-t", "suritui-admin", msg]);
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn suricata_running(runner: &dyn Runner) -> bool {
+    runner
+        .run("/bin/pgrep", &["-x", "suricata"])
+        .map(|o| o.code == Some(0))
+        .unwrap_or(false)
+}
+
+fn reload(paths: &Paths, runner: &dyn Runner) -> Result<(), String> {
+    let o = runner.run(&paths.suricatasc, &["-c", "ruleset-reload-nonblocking"])?;
+    let ok_reply = o.stdout.contains("\"return\": \"OK\"") || o.stdout.contains("\"return\":\"OK\"");
+    if o.code == Some(0) && ok_reply {
+        Ok(())
+    } else {
+        Err(format!("reload was not accepted: {}", o.stdout.trim()))
+    }
+}
+
+/// Disable or enable one rule. Nothing changes unless every check passes; if the
+/// reload fails the previous files are put back and reloaded again.
+pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result<Report, String> {
+    let mut rep = Report::default();
+    if paths.require_root {
+        let id = runner.run("/usr/bin/id", &["-u"])?;
+        if id.stdout.trim() != "0" {
+            return Err("suritui-admin must run as root (through sudo)".into());
+        }
+    }
+    let _lock = Lock::take(&paths.lock, runner)?;
+    for p in ["suricata-update", "suricata-update-reload"] {
+        if runner.run("/bin/pgrep", &["-f", p]).map(|o| o.code == Some(0)).unwrap_or(false) {
+            return Err("a rule update is running right now; try again after it finishes".into());
+        }
+    }
+
+    let rules_meta = plain_file(&paths.rules)?;
+    let dc_meta = plain_file(&paths.disable_conf)?;
+    let live_rules = fs::read_to_string(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
+    if !rule_map(&live_rules).contains_key(&sid) {
+        return Err(format!("sid {sid} is not in the live rules"));
+    }
+    let dc_text = fs::read_to_string(&paths.disable_conf).map_err(|e| io("cannot read disable.conf", e))?;
+    let new_dc = match candidate_disable_conf(&dc_text, verb, sid, &ymd(now()))? {
+        Edit::NoChange(msg) => {
+            say(&mut rep, format!("{msg}; nothing changed"));
+            return Ok(rep);
+        }
+        Edit::Write(t) => t,
+    };
+
+    // 1. back up
+    let stamp = format!("{}-{}", ymd(now()), now());
+    let backup = paths.backup_root.join(&stamp);
+    fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
+    let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
+    fs::copy(&paths.disable_conf, backup.join("disable.conf")).map_err(|e| io("backup of disable.conf", e))?;
+    fs::copy(&paths.rules, backup.join("suricata.rules")).map_err(|e| io("backup of the rules", e))?;
+    say(&mut rep, format!("backup: {}", backup.display()));
+
+    // 2. rebuild into a scratch directory, never into the live one
+    let _ = fs::remove_dir_all(&paths.build_dir);
+    fs::create_dir_all(&paths.build_dir).map_err(|e| io("cannot create the build directory", e))?;
+    let cleanup = |p: &Paths| {
+        let _ = fs::remove_dir_all(&p.build_dir);
+    };
+    let cand_dc = paths.build_dir.join("disable.conf");
+    fs::write(&cand_dc, &new_dc).map_err(|e| io("cannot write the candidate", e))?;
+    let build_dir = paths.build_dir.to_string_lossy().into_owned();
+    let cand_dc_s = cand_dc.to_string_lossy().into_owned();
+    let o = runner.run(
+        "/usr/bin/nice",
+        &[
+            "-n", "15", &paths.suricata_update, "--offline", "--no-reload", "--disable-conf", &cand_dc_s, "-o", &build_dir,
+        ],
+    )?;
+    if o.code != Some(0) {
+        cleanup(paths);
+        let tail: Vec<&str> = o.stdout.lines().chain(o.stderr.lines()).rev().take(3).collect();
+        return Err(format!("the rebuild failed (exit {:?}): {}", o.code, tail.join(" | ")));
+    }
+    let cand_rules_path = paths.build_dir.join("suricata.rules");
+    let cand_rules = fs::read_to_string(&cand_rules_path).map_err(|e| {
+        cleanup(paths);
+        io("the rebuild produced no rules file", e)
+    })?;
+
+    // 3. check the result against the live rules
+    let extra = match check_rule_diff(&live_rules, &cand_rules, sid, verb) {
+        Ok(x) => x,
+        Err(e) => {
+            cleanup(paths);
+            return Err(e);
+        }
+    };
+
+    // 4. install: staged next to the live files, then atomic renames. If the
+    // second one fails the first is undone from the originals held in memory.
+    let _ = fs::remove_dir_all(&paths.build_dir);
+    put(&paths.disable_conf, new_dc.as_bytes(), &dc_meta)?;
+    if let Err(e) = put(&paths.rules, cand_rules.as_bytes(), &rules_meta) {
+        let _ = put(&paths.disable_conf, dc_text.as_bytes(), &dc_meta);
+        return Err(format!("{e} (disable.conf restored)"));
+    }
+    let restore = |p: &Paths| {
+        let a = put(&p.disable_conf, dc_text.as_bytes(), &dc_meta);
+        let b = put(&p.rules, live_rules.as_bytes(), &rules_meta);
+        a.and(b)
+    };
+
+    // 5. live reload; put everything back if Suricata does not take it
+    let reloaded = reload(paths, runner);
+    let healthy = reloaded.is_ok() && {
+        std::thread::sleep(std::time::Duration::from_secs(if paths.require_root { 3 } else { 0 }));
+        suricata_running(runner)
+    };
+    if !healthy {
+        let restored = restore(paths);
+        let again = reload(paths, runner);
+        log_line(paths, runner, &format!("FAILED {} sid {sid}: restored the previous rules", verb.word()));
+        return Err(format!(
+            "Suricata did not take the new rules ({}); the previous rules are back{}",
+            reloaded.err().unwrap_or_else(|| "it stopped running".into()),
+            if restored.is_ok() && again.is_ok() { " and reloaded" } else { ", but restoring or the second reload failed: check Suricata now" }
+        ));
+    }
+    prune_backups(&paths.backup_root);
+    log_line(paths, runner, &format!("{} sid {sid} (backup {stamp})", verb.word()));
+    say(&mut rep, format!("sid {sid} {}d; Suricata reloaded", verb.word()));
+    if !extra.is_empty() {
+        let list: Vec<String> = extra.iter().map(u64::to_string).collect();
+        say(&mut rep, format!("also changed (flowbit dependencies): {}", list.join(" ")));
+    }
+    Ok(rep)
+}
+
+/// Read-only summary for `status`.
+pub fn status(paths: &Paths, runner: &dyn Runner) -> Report {
+    let mut rep = Report::default();
+    say(&mut rep, format!("suricata running: {}", if suricata_running(runner) { "yes" } else { "no" }));
+    match fs::read_to_string(&paths.rules) {
+        Ok(t) => {
+            let m = rule_map(&t);
+            let off = m.values().filter(|(e, _)| !*e).count();
+            say(&mut rep, format!("rules: {} loaded file, {} disabled", m.len(), off));
+        }
+        Err(e) => say(&mut rep, format!("rules: cannot read ({e})")),
+    }
+    let n = fs::read_to_string(&paths.disable_conf)
+        .map(|t| t.lines().filter(|l| line_sid(l).is_some()).count())
+        .unwrap_or(0);
+    say(&mut rep, format!("disable.conf: {n} sids"));
+    let update = runner
+        .run("/bin/pgrep", &["-f", "suricata-update"])
+        .map(|o| o.code == Some(0))
+        .unwrap_or(false);
+    say(&mut rep, format!("update running: {}", if update { "yes" } else { "no" }));
+    rep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    const R_ON: &str = "alert tcp any any -> any any (msg:\"ET SCAN a\"; sid:100; rev:1;)";
+    const R_OFF: &str = "# alert tcp any any -> any any (msg:\"ET SCAN a\"; sid:100; rev:1;)";
+    const R2: &str = "alert tcp any any -> any any (msg:\"ET INFO b\"; sid:200; rev:1;)";
+    const R2_OFF: &str = "# alert tcp any any -> any any (msg:\"ET INFO b\"; sid:200; rev:1;)";
+
+    fn rules(parts: &[&str]) -> String {
+        parts.join("\n") + "\n"
+    }
+
+    #[test]
+    fn sid_validation() {
+        assert_eq!(parse_sid("2012345"), Some(2012345));
+        for bad in ["", "0", "-1", "+5", " 5", "5 ", "1e3", "12345678901", "5;ls", "../x", "0x10", "١٢"] {
+            assert_eq!(parse_sid(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(ymd(0), "1970-01-01");
+        assert_eq!(ymd(1_700_000_000), "2023-11-14");
+        assert_eq!(ymd(951_782_400), "2000-02-29");
+    }
+
+    #[test]
+    fn disable_appends_and_is_idempotent() {
+        let t = "# c\ngroup:x.rules\n5\n";
+        let Edit::Write(w) = candidate_disable_conf(t, Verb::Disable, 9, "2026-01-02").unwrap() else {
+            panic!()
+        };
+        assert_eq!(w, "# c\ngroup:x.rules\n5\n9  # suritui 2026-01-02\n");
+        assert!(matches!(candidate_disable_conf(t, Verb::Disable, 5, "d"), Ok(Edit::NoChange(_))));
+        let Edit::Write(w) = candidate_disable_conf("5", Verb::Disable, 9, "d").unwrap() else { panic!() };
+        assert!(w.starts_with("5\n9"));
+    }
+
+    #[test]
+    fn enable_removes_only_that_sid() {
+        let t = "# keep\n7\n1:9  # suritui d\n9x\ngroup:g.rules\n";
+        let Edit::Write(w) = candidate_disable_conf(t, Verb::Enable, 9, "d").unwrap() else { panic!() };
+        assert_eq!(w, "# keep\n7\n9x\ngroup:g.rules\n");
+        let e = candidate_disable_conf(t, Verb::Enable, 11, "d").unwrap_err();
+        assert!(e.contains("group or pattern"), "{e}");
+    }
+
+    #[test]
+    fn diff_accepts_the_one_expected_flip() {
+        let live = rules(&[R_ON, R2]);
+        let cand = rules(&[R_OFF, R2]);
+        assert_eq!(check_rule_diff(&live, &cand, 100, Verb::Disable), Ok(vec![]));
+    }
+
+    #[test]
+    fn diff_lists_flowbit_dependents_on_enable() {
+        let live = rules(&[R_OFF, R2_OFF]);
+        let cand = rules(&[R_ON, R2]);
+        assert_eq!(check_rule_diff(&live, &cand, 100, Verb::Enable), Ok(vec![200]));
+    }
+
+    #[test]
+    fn diff_refuses_surprises() {
+        let live = rules(&[R_ON, R2]);
+        // target did not flip (flowbit keeps it enabled)
+        let e = check_rule_diff(&live, &live, 100, Verb::Disable).unwrap_err();
+        assert!(e.contains("still enabled"), "{e}");
+        // a rule was removed
+        let e = check_rule_diff(&live, &rules(&[R_OFF]), 100, Verb::Disable).unwrap_err();
+        assert!(e.contains("remove 1"), "{e}");
+        // a rule changed text
+        let changed = rules(&[R_OFF, &R2.replace("rev:1", "rev:2")]);
+        let e = check_rule_diff(&live, &changed, 100, Verb::Disable).unwrap_err();
+        assert!(e.contains("changed text"), "{e}");
+        // unknown sid
+        assert!(check_rule_diff(&live, &live, 999, Verb::Disable).is_err());
+        // empty live file
+        assert!(check_rule_diff("", "", 100, Verb::Disable).is_err());
+    }
+
+    #[test]
+    fn diff_caps_the_number_of_other_flips() {
+        let mk = |on: bool| {
+            let mut v = vec![if on { R_ON.to_string() } else { R_OFF.to_string() }];
+            for i in 0..(MAX_EXTRA_FLIPS + 1) {
+                let body = format!("alert tcp any any -> any any (msg:\"ET X {i}\"; sid:{}; rev:1;)", 1000 + i);
+                v.push(if on { body } else { format!("# {body}") });
+            }
+            v.join("\n") + "\n"
+        };
+        let e = check_rule_diff(&mk(false), &mk(true), 100, Verb::Enable).unwrap_err();
+        assert!(e.contains("limit"), "{e}");
+    }
+
+    // ---- orchestration with a fake runner and a temp dir ----
+
+    enum Rebuild {
+        Rules(String),
+        Fail,
+    }
+
+    struct Fake {
+        calls: RefCell<Vec<String>>,
+        root: bool,
+        update_running: bool,
+        alive: bool,
+        rebuild: Rebuild,
+        reloads: RefCell<Vec<bool>>,
+    }
+
+    impl Fake {
+        fn ok(cand_rules: String) -> Fake {
+            Fake {
+                calls: RefCell::new(vec![]),
+                root: true,
+                update_running: false,
+                alive: true,
+                rebuild: Rebuild::Rules(cand_rules),
+                reloads: RefCell::new(vec![true]),
+            }
+        }
+    }
+
+    fn out(code: i32, stdout: &str) -> Result<Out, String> {
+        Ok(Out { code: Some(code), stdout: stdout.into(), stderr: String::new() })
+    }
+
+    impl Runner for Fake {
+        fn run(&self, prog: &str, args: &[&str]) -> Result<Out, String> {
+            self.calls.borrow_mut().push(format!("{prog} {}", args.join(" ")));
+            match prog {
+                "/usr/bin/id" => out(0, if self.root { "0\n" } else { "1000\n" }),
+                "/bin/pgrep" if args[0] == "-f" => out(if self.update_running { 0 } else { 1 }, ""),
+                "/bin/pgrep" => out(if self.alive { 0 } else { 1 }, ""),
+                "/bin/ps" => out(1, ""),
+                "/usr/bin/nice" => {
+                    let dir = args[args.iter().position(|a| *a == "-o").unwrap() + 1];
+                    match &self.rebuild {
+                        Rebuild::Rules(t) => {
+                            fs::write(Path::new(dir).join("suricata.rules"), t).unwrap();
+                            out(0, "")
+                        }
+                        Rebuild::Fail => out(1, "boom"),
+                    }
+                }
+                "sc" => {
+                    let ok = self.reloads.borrow_mut().pop().unwrap_or(true);
+                    out(if ok { 0 } else { 1 }, if ok { "{\"message\": \"done\", \"return\": \"OK\"}" } else { "{\"return\": \"NOK\"}" })
+                }
+                "/usr/bin/logger" => out(0, ""),
+                other => panic!("unexpected program {other}"),
+            }
+        }
+    }
+
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn setup(tag: &str, live: &str, dc: &str) -> (Tmp, Paths) {
+        let d = std::env::temp_dir().join(format!("suritui-admin-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let p = Paths {
+            disable_conf: d.join("disable.conf"),
+            rules: d.join("suricata.rules"),
+            build_dir: d.join("build"),
+            backup_root: d.join("backups"),
+            lock: d.join("lock"),
+            log: d.join("log"),
+            suricata_update: "su".into(),
+            suricatasc: "sc".into(),
+            require_root: false,
+        };
+        fs::write(&p.rules, live).unwrap();
+        fs::write(&p.disable_conf, dc).unwrap();
+        (Tmp(d), p)
+    }
+
+    fn calls(f: &Fake) -> String {
+        f.calls.borrow().join("\n")
+    }
+
+    #[test]
+    fn apply_installs_reloads_and_backs_up() {
+        let live = rules(&[R_ON, R2]);
+        let (_t, p) = setup("ok", &live, "5\n");
+        let f = Fake::ok(rules(&[R_OFF, R2]));
+        let rep = apply(&p, &f, Verb::Disable, 100).unwrap();
+        assert!(rep.lines.iter().any(|l| l.contains("sid 100 disabled")), "{rep:?}");
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), rules(&[R_OFF, R2]));
+        assert!(fs::read_to_string(&p.disable_conf).unwrap().contains("100  # suritui"));
+        assert!(!p.build_dir.exists() && !p.lock.exists());
+        let b: Vec<_> = fs::read_dir(&p.backup_root).unwrap().collect();
+        assert_eq!(b.len(), 1);
+        let bdir = b[0].as_ref().unwrap().path();
+        assert_eq!(fs::read_to_string(bdir.join("suricata.rules")).unwrap(), live);
+        assert_eq!(fs::read_to_string(bdir.join("disable.conf")).unwrap(), "5\n");
+        let c = calls(&f);
+        assert!(c.contains("--offline") && c.contains("--no-reload") && c.contains("ruleset-reload-nonblocking"), "{c}");
+        assert!(fs::read_to_string(&p.log).unwrap().contains("disable sid 100"));
+    }
+
+    #[test]
+    fn failed_reload_restores_both_files() {
+        let live = rules(&[R_ON, R2]);
+        let (_t, p) = setup("reload", &live, "5\n");
+        let f = Fake::ok(rules(&[R_OFF, R2]));
+        *f.reloads.borrow_mut() = vec![true, false]; // popped from the back: first call fails
+        let e = apply(&p, &f, Verb::Disable, 100).unwrap_err();
+        assert!(e.contains("previous rules are back and reloaded"), "{e}");
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
+        assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "5\n");
+    }
+
+    #[test]
+    fn dead_suricata_after_reload_restores() {
+        let live = rules(&[R_ON]);
+        let (_t, p) = setup("dead", &live, "5\n");
+        let mut f = Fake::ok(rules(&[R_OFF]));
+        f.alive = false;
+        let e = apply(&p, &f, Verb::Disable, 100).unwrap_err();
+        assert!(e.contains("stopped running"), "{e}");
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
+        assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "5\n");
+    }
+
+    #[test]
+    fn failed_rebuild_changes_nothing() {
+        let live = rules(&[R_ON]);
+        let (_t, p) = setup("fail", &live, "5\n");
+        let mut f = Fake::ok(String::new());
+        f.rebuild = Rebuild::Fail;
+        let e = apply(&p, &f, Verb::Disable, 100).unwrap_err();
+        assert!(e.contains("rebuild failed"), "{e}");
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
+        assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "5\n");
+        assert!(!p.build_dir.exists() && !p.lock.exists());
+        assert!(!calls(&f).contains("ruleset-reload"));
+    }
+
+    #[test]
+    fn surprising_rebuild_is_refused_before_install() {
+        let live = rules(&[R_ON, R2]);
+        let (_t, p) = setup("surprise", &live, "5\n");
+        let f = Fake::ok(rules(&[R_OFF])); // lost a rule
+        assert!(apply(&p, &f, Verb::Disable, 100).is_err());
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
+        assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "5\n");
+        assert!(!calls(&f).contains("ruleset-reload"));
+    }
+
+    #[test]
+    fn already_listed_is_a_no_op_without_a_rebuild() {
+        let (_t, p) = setup("noop", &rules(&[R_OFF]), "100\n");
+        let f = Fake::ok(String::new());
+        let rep = apply(&p, &f, Verb::Disable, 100).unwrap();
+        assert!(rep.lines[0].contains("nothing changed"));
+        assert!(!calls(&f).contains("nice"));
+        assert!(!p.backup_root.exists());
+    }
+
+    #[test]
+    fn refuses_unknown_sid_update_in_progress_and_non_root() {
+        let live = rules(&[R_ON]);
+        let (_t, p) = setup("refuse", &live, "5\n");
+        let f = Fake::ok(String::new());
+        assert!(apply(&p, &f, Verb::Disable, 999).unwrap_err().contains("not in the live rules"));
+        let mut f = Fake::ok(String::new());
+        f.update_running = true;
+        assert!(apply(&p, &f, Verb::Disable, 100).unwrap_err().contains("update is running"));
+        let mut f = Fake::ok(String::new());
+        f.root = false;
+        let mut p2 = p.clone();
+        p2.require_root = true;
+        assert!(apply(&p2, &f, Verb::Disable, 100).unwrap_err().contains("must run as root"));
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
+        assert!(!calls(&f).contains("nice"));
+    }
+
+    #[test]
+    fn a_stale_lock_is_replaced_and_a_live_one_blocks() {
+        let live = rules(&[R_ON]);
+        let (_t, p) = setup("lock", &live, "5\n");
+        fs::write(&p.lock, "4242\n").unwrap();
+        // fake `ps` says the pid is dead -> stale lock is taken over
+        let f = Fake::ok(rules(&[R_OFF]));
+        assert!(apply(&p, &f, Verb::Disable, 100).is_ok());
+    }
+
+    #[test]
+    fn old_backups_are_pruned() {
+        let (_t, p) = setup("prune", &rules(&[R_ON]), "5\n");
+        fs::create_dir_all(&p.backup_root).unwrap();
+        for i in 0..(KEEP_BACKUPS + 3) {
+            fs::create_dir_all(p.backup_root.join(format!("2020-01-01-{i:03}"))).unwrap();
+        }
+        prune_backups(&p.backup_root);
+        assert_eq!(fs::read_dir(&p.backup_root).unwrap().count(), KEEP_BACKUPS);
+        assert!(!p.backup_root.join("2020-01-01-000").exists());
+    }
+
+    #[test]
+    fn status_reports_counts() {
+        let (_t, p) = setup("status", &rules(&[R_ON, R2_OFF]), "5\n# c\n7\n");
+        let f = Fake::ok(String::new());
+        let s = status(&p, &f).lines.join("\n");
+        assert!(s.contains("suricata running: yes") && s.contains("2 loaded file, 1 disabled"), "{s}");
+        assert!(s.contains("disable.conf: 2 sids"), "{s}");
+    }
+
+    #[test]
+    fn symlinked_live_files_are_refused() {
+        let live = rules(&[R_ON]);
+        let (t, p) = setup("symlink", &live, "5\n");
+        let real = t.0.join("real.rules");
+        fs::rename(&p.rules, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &p.rules).unwrap();
+        let f = Fake::ok(rules(&[R_OFF]));
+        assert!(apply(&p, &f, Verb::Disable, 100).unwrap_err().contains("not a regular file"));
+        assert_eq!(fs::read_to_string(&real).unwrap(), live);
+    }
+
+    #[test]
+    fn a_planted_staging_symlink_is_not_written_through() {
+        let live = rules(&[R_ON]);
+        let (t, p) = setup("plant", &live, "5\n");
+        let victim = t.0.join("victim");
+        fs::write(&victim, "precious").unwrap();
+        std::os::unix::fs::symlink(&victim, t.0.join("suricata.rules.suritui-new")).unwrap();
+        std::os::unix::fs::symlink(&victim, t.0.join("disable.conf.suritui-new")).unwrap();
+        let f = Fake::ok(rules(&[R_OFF]));
+        apply(&p, &f, Verb::Disable, 100).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), rules(&[R_OFF]));
+    }
+
+    #[test]
+    fn installed_files_keep_mode_of_the_live_ones() {
+        let (_t, p) = setup("mode", &rules(&[R_ON]), "5\n");
+        fs::set_permissions(&p.rules, fs::Permissions::from_mode(0o640)).unwrap();
+        let f = Fake::ok(rules(&[R_OFF]));
+        apply(&p, &f, Verb::Disable, 100).unwrap();
+        assert_eq!(fs::metadata(&p.rules).unwrap().mode() & 0o777, 0o640);
+    }
+}

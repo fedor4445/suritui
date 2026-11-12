@@ -74,7 +74,7 @@ fn last_number(line: &str, key: &str) -> Option<u64> {
     found
 }
 
-fn parse_line(line: &str) -> Option<Rule> {
+pub(crate) fn parse_line(line: &str) -> Option<Rule> {
     let text = line.trim();
     let body = text.trim_start_matches('#').trim_start();
     let action = body.split_whitespace().next()?;
