@@ -1991,7 +1991,7 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
             Ok(vec![])
         }
         fn sources(&self, _refresh: bool) -> Result<Vec<String>, String> {
-            Ok("Enabled sources:\n  - et/open\n=====index=====\nName: et/open\n  Summary: ET Open\n  License: MIT\nName: abuse.ch/urlhaus\n  Summary: URLhaus rules\n  License: CC0-1.0\nName: et/pro\n  License: Commercial\n  Parameters: secret-code\nName: snort-registered\n  Summary: Snort registered rules\n  License: Registered\n  Parameters: oinkcode\nName: odd/two\n  License: Commercial\n  Parameters: user, secret-code\n"
+            Ok("Enabled sources:\n  - et/open\n=====index=====\nName: et/open\n  Summary: ET Open\n  License: MIT\nName: abuse.ch/urlhaus\n  Summary: URLhaus rules\n  License: CC0-1.0\nName: et/pro\n  License: Commercial\n  Parameters: secret-code\nName: odd/two\n  License: Commercial\n  Parameters: user, secret-code\n"
                 .lines()
                 .map(str::to_string)
                 .collect())
@@ -2000,8 +2000,8 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
             self.calls.lock().unwrap().push(format!("{enable} {name}"));
             Ok(vec!["rules updated".to_string()])
         }
-        fn source_key(&self, name: &str, snapshot: Option<&str>, key: &str) -> Result<Vec<String>, String> {
-            self.calls.lock().unwrap().push(format!("key {name} {snapshot:?} {key}"));
+        fn source_key(&self, name: &str, key: &str) -> Result<Vec<String>, String> {
+            self.calls.lock().unwrap().push(format!("key {name} {key}"));
             Ok(vec!["rules updated".to_string()])
         }
         fn reload(&self) -> Result<(RuleIndex, DisableConf), String> {
@@ -2018,7 +2018,7 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         key(&mut a, '3');
         assert_eq!(a.mode, Mode::Sources);
         let s = screen(&a, 110, 20);
-        assert!(s.contains("Free sources available (1)") && s.contains("Need a key or subscription (3)"), "{s}");
+        assert!(s.contains("Free sources available (1)") && s.contains("Need a key or subscription (2)"), "{s}");
         // et/open (enabled) is highlighted first: e says it is already on, d asks.
         key(&mut a, 'e');
         assert_eq!(a.mode, Mode::Sources);
@@ -2056,7 +2056,7 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         a.set_admin(fake.clone());
         press(&mut a, KeyCode::Esc);
         key(&mut a, '3');
-        // enabled: et/open; free: urlhaus-less list has none but et/open is enabled; keyed: et/pro, snort, odd/two
+        // enabled: et/open; free: urlhaus-less list has none but et/open is enabled; keyed: et/pro, odd/two
         let items: Vec<String> = a.source_items().iter().map(|(s, _)| s.name.clone()).collect();
         let pro = items.iter().position(|n| n == "et/pro").unwrap();
         for _ in 0..pro {
@@ -2087,31 +2087,30 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(a.mode, Mode::Done);
-        assert_eq!(*fake.calls.lock().unwrap(), vec!["key et/pro None badSECRETKEY123".to_string()]);
+        assert_eq!(*fake.calls.lock().unwrap(), vec!["key et/pro badSECRETKEY123".to_string()]);
         assert!(a.key_entry.is_none());
     }
 
     #[test]
-    fn snort_asks_for_the_snapshot_first_and_odd_sources_are_refused() {
+    fn odd_sources_are_refused_and_the_key_form_can_be_cancelled() {
         let mut a = rules_app();
         a.set_admin(Arc::new(FakeSrc { calls: Default::default() }));
         press(&mut a, KeyCode::Esc);
         key(&mut a, '3');
         let items: Vec<String> = a.source_items().iter().map(|(s, _)| s.name.clone()).collect();
-        let snort = items.iter().position(|n| n == "snort-registered").unwrap();
-        for _ in 0..snort {
+        assert!(!items.iter().any(|n| n.contains("snort")));
+        let pro = items.iter().position(|n| n == "et/pro").unwrap();
+        for _ in 0..pro {
             key(&mut a, 'j');
         }
         key(&mut a, 'e');
         assert_eq!(a.mode, Mode::KeyEntry);
-        type_text(&mut a, "29200");
-        press(&mut a, KeyCode::Enter); // next field
         type_text(&mut a, "0123456789abcdef");
         press(&mut a, KeyCode::Esc);
         assert_eq!(a.mode, Mode::Sources);
         assert!(a.key_entry.is_none());
         let odd = items.iter().position(|n| n == "odd/two").unwrap();
-        for _ in snort..odd {
+        for _ in pro..odd {
             key(&mut a, 'j');
         }
         key(&mut a, 'e');

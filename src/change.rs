@@ -32,9 +32,8 @@ pub enum Action {
     Update,
     /// Switch a free rule source on or off, then install the new rule set.
     Source { enable: bool, name: String },
-    /// Store a key for a source that needs one and switch it on. `snapshot` is
-    /// the Snort snapshot number (Snort only).
-    SourceKey { name: String, snapshot: Option<String>, key: Secret },
+    /// Store a key for a source that needs one and switch it on.
+    SourceKey { name: String, key: Secret },
 }
 
 /// What the user is being asked to confirm.
@@ -66,7 +65,7 @@ pub trait Admin: Send + Sync {
         Err("changing sources is not available here".to_string())
     }
     /// Store a key and switch the source on.
-    fn source_key(&self, _name: &str, _snapshot: Option<&str>, _key: &str) -> Result<Vec<String>, String> {
+    fn source_key(&self, _name: &str, _key: &str) -> Result<Vec<String>, String> {
         Err("keys are not available here".to_string())
     }
     /// The text of the Updates screen.
@@ -94,7 +93,7 @@ pub trait Admin: Send + Sync {
             Action::Rule(v, sid) => self.change(*v, *sid),
             Action::Update => self.update(),
             Action::Source { enable, name } => self.source(*enable, name),
-            Action::SourceKey { name, snapshot, key } => self.source_key(name, snapshot.as_deref(), &key.0),
+            Action::SourceKey { name, key } => self.source_key(name, &key.0),
             Action::Suppress { add, sid, track, ip } => self.suppress(*add, *sid, *track, ip),
         }
     }
@@ -170,11 +169,8 @@ impl Admin for LocalAdmin {
         run_helper(&["source", if enable { "enable" } else { "disable" }, name])
     }
 
-    fn source_key(&self, name: &str, snapshot: Option<&str>, key: &str) -> Result<Vec<String>, String> {
-        match snapshot {
-            Some(v) => run_helper_with(&["source", "snort", v], Some(key)),
-            None => run_helper_with(&["source", "key", name], Some(key)),
-        }
+    fn source_key(&self, name: &str, key: &str) -> Result<Vec<String>, String> {
+        run_helper_with(&["source", "key", name], Some(key))
     }
 
     fn suppress(&self, add: bool, sid: u64, track: Track, ip: &str) -> Result<Vec<String>, String> {

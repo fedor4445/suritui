@@ -20,8 +20,6 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_SOURCE: &str = "et/open";
-/// The one custom source: Snort's registered rules, which need a hand-made URL.
-pub const SNORT: &str = "snort-registered";
 
 /// A source name from the index: letters, digits and `/ _ . -` only.
 pub fn valid_name(s: &str) -> bool {
@@ -35,10 +33,6 @@ pub fn valid_name(s: &str) -> bool {
 /// A key as the vendors issue them: letters, digits, `-` and `_`.
 pub fn valid_key(s: &str) -> bool {
     (8..=128).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-}
-
-fn valid_snapshot(s: &str) -> bool {
-    (3..=6).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn file_name(name: &str) -> String {
@@ -218,11 +212,6 @@ pub fn list(paths: &Paths, runner: &dyn Runner, refresh: bool) -> Result<Report,
     rep.lines.extend(en.stdout.lines().map(str::to_string));
     say(&mut rep, SEPARATOR);
     rep.lines.extend(all.stdout.lines().map(str::to_string));
-    // The custom Snort entry is not in any index; the screen lists it as keyed.
-    for l in ["Name: snort-registered", "  Summary: Snort registered rules (needs the snapshot number and your oinkcode)",
-              "  License: Registered", "  Parameters: oinkcode"] {
-        say(&mut rep, l);
-    }
     Ok(rep)
 }
 
@@ -322,38 +311,24 @@ fn remove_source_file(paths: &Paths, name: &str) -> Result<(), String> {
 }
 
 /// Store a key for a source that needs one, switch it on and install.
-/// `version` is the Snort snapshot number (only for `snort-registered`).
-pub fn set_key(paths: &Paths, runner: &dyn Runner, name: &str, version: Option<&str>, key: &str) -> Result<Report, String> {
+pub fn set_key(paths: &Paths, runner: &dyn Runner, name: &str, key: &str) -> Result<Report, String> {
     if !valid_key(key) {
         return Err("the key must be 8 to 128 letters, digits, - or _".into());
     }
-    let (content, replaces) = if name == SNORT {
-        let Some(v) = version.filter(|v| valid_snapshot(v)) else {
-            return Err("the Snort snapshot number must be 3 to 6 digits".into());
-        };
-        let url = format!("https://www.snort.org/rules/snortrules-snapshot-{v}.tar.gz?oinkcode={key}");
-        (format!("checksum: true\nsource: {SNORT}\nurl: {url}\n"), None)
-    } else {
-        if !valid_name(name) || version.is_some() {
-            return Err("not a valid source name".into());
-        }
-        (String::new(), Some(()))
-    };
+    if !valid_name(name) {
+        return Err("not a valid source name".into());
+    }
     let _lock = begin(paths, runner)?;
     check_dirs(paths)?;
     let (enabled, all) = index(paths, runner)?;
-    let mut content = content;
-    let mut replaced: Option<String> = None;
-    if replaces.is_some() {
-        let Some(src) = all.iter().find(|s| s.name == name) else {
-            return Err(format!("{name} is not in the source index"));
-        };
-        if src.params != ["secret-code"] {
-            return Err(format!("{name} needs something other than a plain access code; set it up by hand"));
-        }
-        content = format!("params:\n  secret-code: {key}\nsource: {name}\n");
-        replaced = src.replaces.clone();
+    let Some(src) = all.iter().find(|s| s.name == name) else {
+        return Err(format!("{name} is not in the source index"));
+    };
+    if src.params != ["secret-code"] {
+        return Err(format!("{name} needs something other than a plain access code; set it up by hand"));
     }
+    let content = format!("params:\n  secret-code: {key}\nsource: {name}\n");
+    let replaced = src.replaces.clone();
     let first = enabled.is_empty() && replaced.as_deref() != Some(DEFAULT_SOURCE);
     let file = paths.sources_dir.join(file_name(name));
     let (uid, gid) = {
@@ -441,8 +416,12 @@ mod tests {
                     let dir = args[args.iter().position(|a| *a == "-o").unwrap() + 1];
                     fs::write(Path::new(dir).join("suricata.rules"), &self.build).unwrap();
                     if self.fetch_error.get() {
-                        let leaked = fs::read_to_string(self.dir.join("snort-registered.yaml")).unwrap_or_default();
-                        let url = leaked.lines().find_map(|l| l.strip_prefix("url: ")).unwrap_or("https://x.example/r.tar.gz");
+                        // A vendor that puts the key in the download path.
+                        let leaked = fs::read_to_string(self.dir.join("et-pro.yaml")).unwrap_or_default();
+                        let url = match leaked.lines().find_map(|l| l.trim().strip_prefix("secret-code: ")) {
+                            Some(key) => format!("https://rules.example/{key}/r.tar.gz?oinkcode={key}"),
+                            None => "https://x.example/r.tar.gz".to_string(),
+                        };
                         return out(0, &format!("12/11/2026 -- 05:52:07 - <Error> -- Failed to fetch {url}: HTTP Error 410: Gone\n"));
                     }
                     out(0, "")
@@ -520,18 +499,17 @@ mod tests {
         for bad in ["short", "has space1234", "new\nline1234", "q?x=1&y=2zz", "", &"a".repeat(129)] {
             assert!(!valid_key(bad), "{bad:?}");
         }
-        assert!(valid_snapshot("29200") && !valid_snapshot("29x00") && !valid_snapshot("12"));
     }
 
     #[test]
-    fn list_has_both_parts_and_the_snort_entry() {
+    fn list_has_both_parts_and_no_snort_entry() {
         let (_t, p, f) = setup("list", &["et/open"], "");
         let l = list(&p, &f, false).unwrap().lines;
         let at = l.iter().position(|x| x == SEPARATOR).unwrap();
         assert_eq!(parse_enabled(&l[..at].join("\n")), vec!["et/open"]);
         let all = parse_sources(&l[at + 1..].join("\n"));
         assert!(all.iter().any(|s| s.name == "et/pro" && s.params == ["secret-code"]));
-        assert!(all.iter().any(|s| s.name == SNORT && s.needs_key));
+        assert!(!all.iter().any(|s| s.name.contains("snort")));
     }
 
     #[test]
@@ -598,7 +576,7 @@ mod tests {
     #[test]
     fn a_pro_key_is_stored_private_and_replaces_et_open() {
         let (_t, p, f) = setup("pro", &["et/open"], &three());
-        let r = set_key(&p, &f, "et/pro", None, KEY).unwrap().lines.join("\n");
+        let r = set_key(&p, &f, "et/pro", KEY).unwrap().lines.join("\n");
         assert!(r.contains("et/pro replaces et/open"), "{r}");
         assert!(!r.contains(KEY));
         let file = p.sources_dir.join("et-pro.yaml");
@@ -610,41 +588,26 @@ mod tests {
 
     #[test]
     fn a_wrong_key_changes_nothing_and_never_shows_in_the_error() {
-        // Snort source: the failed download message contains the whole URL.
-        let (_t, p, f) = setup("snort", &["et/open"], &three());
+        // The failed download message can contain the whole URL, key included.
+        let (_t, p, f) = setup("wrong", &["et/open"], &three());
         f.fetch_error.set(true);
-        let e = set_key(&p, &f, SNORT, Some("29200"), KEY).unwrap_err();
+        let e = set_key(&p, &f, "et/pro", KEY).unwrap_err();
         assert!(e.contains("Failed to fetch") && e.contains("oinkcode=***"), "{e}");
         assert!(!e.contains(KEY), "{e}");
         assert_eq!(f.names(), vec!["et/open"]);
-        assert!(!p.sources_dir.join("snort-registered.yaml").exists());
+        assert!(!p.sources_dir.join("et-pro.yaml").exists());
         // The helper's own log line never has the key either.
         assert!(!f.calls.borrow().iter().any(|c| c.contains(KEY)));
     }
 
     #[test]
-    fn snort_is_stored_as_a_url_and_works() {
-        let (_t, p, f) = setup("snort2", &["et/open"], &three());
-        let r = set_key(&p, &f, SNORT, Some("29200"), KEY).unwrap().lines.join("\n");
-        assert!(!r.contains(KEY), "{r}");
-        let t = fs::read_to_string(p.sources_dir.join("snort-registered.yaml")).unwrap();
-        assert!(t.contains(&format!("url: https://www.snort.org/rules/snortrules-snapshot-29200.tar.gz?oinkcode={KEY}")));
-        assert_eq!(fs::metadata(p.sources_dir.join("snort-registered.yaml")).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(f.names(), vec!["et/open", "snort-registered"]);
-        // and it can be switched off again
-        change(&p, &f, false, "snort-registered").unwrap();
-        assert_eq!(f.names(), vec!["et/open"]);
-    }
-
-    #[test]
     fn key_requests_are_checked() {
         let (_t, p, f) = setup("badkey", &["et/open"], &three());
-        assert!(set_key(&p, &f, "et/pro", None, "short").is_err());
-        assert!(set_key(&p, &f, SNORT, None, KEY).unwrap_err().contains("snapshot"));
-        assert!(set_key(&p, &f, SNORT, Some("../x"), KEY).is_err());
-        assert!(set_key(&p, &f, "odd/two", None, KEY).unwrap_err().contains("by hand"));
-        assert!(set_key(&p, &f, "et/pro", Some("1"), KEY).is_err());
-        assert!(set_key(&p, &f, "abuse.ch/urlhaus", None, KEY).unwrap_err().contains("by hand"));
+        assert!(set_key(&p, &f, "et/pro", "short").is_err());
+        assert!(set_key(&p, &f, "snort-registered", KEY).is_err());
+        assert!(set_key(&p, &f, "../x", KEY).is_err());
+        assert!(set_key(&p, &f, "odd/two", KEY).unwrap_err().contains("by hand"));
+        assert!(set_key(&p, &f, "abuse.ch/urlhaus", KEY).unwrap_err().contains("by hand"));
         assert!(f.calls.borrow().iter().all(|c| !c.contains("enable-source")));
     }
 
@@ -656,7 +619,7 @@ mod tests {
         fs::remove_dir_all(&p.sources_dir).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &p.sources_dir).unwrap();
         assert!(change(&p, &f, true, "abuse.ch/urlhaus").unwrap_err().contains("not a plain directory"));
-        assert!(set_key(&p, &f, "et/pro", None, KEY).is_err());
+        assert!(set_key(&p, &f, "et/pro", KEY).is_err());
         assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
     }
 

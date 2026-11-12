@@ -367,8 +367,8 @@ impl App {
 
     pub fn key_char(&mut self, c: char) {
         let Some(e) = &mut self.key_entry else { return };
-        let (label, val, masked) = &mut e.fields[e.idx];
-        let ok = if *masked || label.starts_with("Snapshot") { c.is_ascii_alphanumeric() || c == '-' || c == '_' } else { false };
+        let (_, val, masked) = &mut e.fields[e.idx];
+        let ok = *masked && (c.is_ascii_alphanumeric() || c == '-' || c == '_');
         if ok && val.len() < 128 {
             val.push(c);
         }
@@ -398,33 +398,22 @@ impl App {
         if e.idx + 1 < e.fields.len() {
             return self.key_next();
         }
-        let (snapshot, key) = match e.fields.as_slice() {
-            [(_, snap, _), (_, key, _)] => (Some(snap.clone()), key.clone()),
-            [(_, key, _)] => (None, key.clone()),
+        let key = match e.fields.as_slice() {
+            [(_, key, _)] => key.clone(),
             _ => return,
         };
-        if let Some(s) = &snapshot {
-            if !(3..=6).contains(&s.len()) || !s.bytes().all(|b| b.is_ascii_digit()) {
-                self.status = "the snapshot number is 3 to 6 digits".to_string();
-                return;
-            }
-        }
         if !crate::sources::valid_key(&key) {
             self.status = "the code must be 8 to 128 letters, digits, - or _".to_string();
             return;
         }
         let Some(e) = self.key_entry.take() else { return };
-        let snort = e.name == crate::sources::SNORT;
-        let mut how = "stores the code in a file only root can read, downloads this source's rules together with the \
+        let how = "stores the code in a file only root can read, downloads this source's rules together with the \
                        others and installs them (about 2 minutes); if the download or the check fails, everything is \
                        put back and the code is forgotten"
             .to_string();
-        if snort {
-            how.push_str(". Snort rules are written for Snort: Suricata skips or rejects some of them");
-        }
         self.status.clear();
         self.pending = Some(Pending {
-            action: Action::SourceKey { name: e.name.clone(), snapshot, key: crate::change::Secret(key) },
+            action: Action::SourceKey { name: e.name.clone(), key: crate::change::Secret(key) },
             msg: format!("Store the code for {} and switch it on: {}", e.name, e.summary),
             how,
             from: Mode::Sources,
@@ -455,16 +444,11 @@ impl App {
             return;
         }
         if enable && src.needs_key {
-            let snort = src.name == crate::sources::SNORT;
-            if !snort && src.params != ["secret-code"] {
+            if src.params != ["secret-code"] {
                 self.status = "this source needs more than a plain access code; set it up by hand".to_string();
                 return;
             }
-            let mut fields = Vec::new();
-            if snort {
-                fields.push(("Snapshot number (for example 29200; see snort.org/downloads)".to_string(), String::new(), false));
-            }
-            fields.push((if snort { "Oinkcode" } else { "Access code" }.to_string(), String::new(), true));
+            let fields = vec![("Access code".to_string(), String::new(), true)];
             self.status.clear();
             self.key_entry = Some(KeyEntry { name: src.name.clone(), summary: src.summary.clone(), fields, idx: 0 });
             self.set_mode(Mode::KeyEntry);

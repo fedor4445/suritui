@@ -10,7 +10,6 @@
 //!   suritui-admin sources [refresh]
 //!   suritui-admin source enable|disable NAME
 //!   suritui-admin source key NAME          (the key on stdin, never on the command line)
-//!   suritui-admin source snort SNAPSHOT    (the oinkcode on stdin)
 //!   suritui-admin disable SID
 //!   suritui-admin enable SID
 //!
@@ -23,7 +22,7 @@ use suritui::update::{apply_update, info};
 use suritui::source::Range;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: suritui-admin status | info | log suricata|update|admin | update | suppress|unsuppress SID by_src|by_dst IP | rules | sources [refresh] | source enable|disable NAME | source key NAME | source snort SNAPSHOT | alerts live | alerts day K | disable SID | enable SID");
+    eprintln!("usage: suritui-admin status | info | log suricata|update|admin | update | suppress|unsuppress SID by_src|by_dst IP | rules | sources [refresh] | source enable|disable NAME | source key NAME | alerts live | alerts day K | disable SID | enable SID");
     ExitCode::from(2)
 }
 
@@ -79,11 +78,7 @@ fn main() -> ExitCode {
             suritui::sources::change(&paths, &runner, *verb == "enable", name)
         }
         ["source", "key", name] => match read_key() {
-            Ok(k) => suritui::sources::set_key(&paths, &runner, name, None, &k),
-            Err(e) => Err(e),
-        },
-        ["source", "snort", snapshot] => match read_key() {
-            Ok(k) => suritui::sources::set_key(&paths, &runner, suritui::sources::SNORT, Some(snapshot), &k),
+            Ok(k) => suritui::sources::set_key(&paths, &runner, name, &k),
             Err(e) => Err(e),
         },
         [verb @ ("suppress" | "unsuppress"), sid, track, ip] => {
