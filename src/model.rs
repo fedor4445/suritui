@@ -30,6 +30,8 @@ pub enum Mode {
     RuleInfo,
     /// Rule sources.
     Sources,
+    /// Typing the key of a source.
+    KeyEntry,
     /// Asking before a rule is disabled or enabled.
     Confirm,
     /// The helper is working.
@@ -62,6 +64,22 @@ impl Mode {
                 | Mode::Settings
                 | Mode::Logs
         )
+    }
+}
+
+/// The form for the key of a source. Its values are never printed (Debug hides them).
+#[derive(Clone)]
+pub struct KeyEntry {
+    pub name: String,
+    pub summary: String,
+    /// (label, value, masked)
+    pub fields: Vec<(String, String, bool)>,
+    pub idx: usize,
+}
+
+impl std::fmt::Debug for KeyEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeyEntry({})", self.name)
     }
 }
 
@@ -102,6 +120,7 @@ pub struct App {
     pub browser: Option<RulesBrowser>,
     pub sources: Option<SourcesView>,
     pub src_sel: usize,
+    pub key_entry: Option<KeyEntry>,
     admin: Option<Arc<dyn Admin>>,
     pub pending: Option<Pending>,
     pub job: Option<Job>,
@@ -148,6 +167,7 @@ impl App {
             browser: None,
             sources: None,
             src_sel: 0,
+            key_entry: None,
             admin: None,
             pending: None,
             job: None,
@@ -339,9 +359,77 @@ impl App {
                 .iter()
                 .map(|s| (s, true))
                 .chain(v.free.iter().map(|s| (s, false)))
+                .chain(v.keyed.iter().map(|s| (s, false)))
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    pub fn key_char(&mut self, c: char) {
+        let Some(e) = &mut self.key_entry else { return };
+        let (label, val, masked) = &mut e.fields[e.idx];
+        let ok = if *masked || label.starts_with("Snapshot") { c.is_ascii_alphanumeric() || c == '-' || c == '_' } else { false };
+        if ok && val.len() < 128 {
+            val.push(c);
+        }
+    }
+
+    pub fn key_backspace(&mut self) {
+        if let Some(e) = &mut self.key_entry {
+            e.fields[e.idx].1.pop();
+        }
+    }
+
+    pub fn key_next(&mut self) {
+        if let Some(e) = &mut self.key_entry {
+            e.idx = (e.idx + 1) % e.fields.len();
+        }
+    }
+
+    pub fn key_cancel(&mut self) {
+        self.key_entry = None;
+        self.status.clear();
+        self.set_mode(Mode::Sources);
+    }
+
+    /// Enter in the key form: check what was typed and ask for the final yes.
+    pub fn key_submit(&mut self) {
+        let Some(e) = &self.key_entry else { return };
+        if e.idx + 1 < e.fields.len() {
+            return self.key_next();
+        }
+        let (snapshot, key) = match e.fields.as_slice() {
+            [(_, snap, _), (_, key, _)] => (Some(snap.clone()), key.clone()),
+            [(_, key, _)] => (None, key.clone()),
+            _ => return,
+        };
+        if let Some(s) = &snapshot {
+            if !(3..=6).contains(&s.len()) || !s.bytes().all(|b| b.is_ascii_digit()) {
+                self.status = "the snapshot number is 3 to 6 digits".to_string();
+                return;
+            }
+        }
+        if !crate::sources::valid_key(&key) {
+            self.status = "the code must be 8 to 128 letters, digits, - or _".to_string();
+            return;
+        }
+        let Some(e) = self.key_entry.take() else { return };
+        let snort = e.name == crate::sources::SNORT;
+        let mut how = "stores the code in a file only root can read, downloads this source's rules together with the \
+                       others and installs them (about 2 minutes); if the download or the check fails, everything is \
+                       put back and the code is forgotten"
+            .to_string();
+        if snort {
+            how.push_str(". Snort rules are written for Snort: Suricata skips or rejects some of them");
+        }
+        self.status.clear();
+        self.pending = Some(Pending {
+            action: Action::SourceKey { name: e.name.clone(), snapshot, key: crate::change::Secret(key) },
+            msg: format!("Store the code for {} and switch it on: {}", e.name, e.summary),
+            how,
+            from: Mode::Sources,
+        });
+        self.set_mode(Mode::Confirm);
     }
 
     pub fn move_source(&mut self, delta: i32) {
@@ -364,6 +452,22 @@ impl App {
             } else {
                 "this source is not enabled (e switches it on)".to_string()
             };
+            return;
+        }
+        if enable && src.needs_key {
+            let snort = src.name == crate::sources::SNORT;
+            if !snort && src.params != ["secret-code"] {
+                self.status = "this source needs more than a plain access code; set it up by hand".to_string();
+                return;
+            }
+            let mut fields = Vec::new();
+            if snort {
+                fields.push(("Snapshot number (for example 29200; see snort.org/downloads)".to_string(), String::new(), false));
+            }
+            fields.push((if snort { "Oinkcode" } else { "Access code" }.to_string(), String::new(), true));
+            self.status.clear();
+            self.key_entry = Some(KeyEntry { name: src.name.clone(), summary: src.summary.clone(), fields, idx: 0 });
+            self.set_mode(Mode::KeyEntry);
             return;
         }
         let first = enable && self.sources.as_ref().is_some_and(|v| v.enabled.is_empty()) && src.name != "et/open";
@@ -494,7 +598,7 @@ impl App {
         // Back to where the change started: the alert list for an alert's rule.
         self.after_done = match (&action, p.from) {
             (Action::Update, _) => Mode::Updates,
-            (Action::Source { .. }, _) => Mode::Sources,
+            (Action::Source { .. } | Action::SourceKey { .. }, _) => Mode::Sources,
             (Action::Suppress { .. }, Mode::Thresholds) => Mode::Thresholds,
             (_, Mode::Detail | Mode::Rule) => Mode::List,
             _ => Mode::Rules,

@@ -379,6 +379,7 @@ mod tests {
             log: d.join("log"),
             suricata_update: "su".into(),
             suricatasc: "sc".into(),
+            sources_dir: d.join("sources"),
             require_root: false,
             reload_wait_secs: 0,
         };

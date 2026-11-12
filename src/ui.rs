@@ -88,6 +88,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Settings => draw_settings(f, app, body),
         Mode::Logs => draw_logs(f, app, body),
         Mode::Confirm => draw_confirm(f, app, body),
+        Mode::KeyEntry => draw_key_entry(f, app, body),
         Mode::Working => draw_working(f, app, body),
         Mode::Done => draw_done(f, app, body),
     }
@@ -108,6 +109,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Settings => "  R reload   1 alerts   2 rules   4 updates   7 logs",
         Mode::Logs => "  Tab next log   R reload   G end   1 alerts   6 settings",
         Mode::Confirm => "  y confirm   Esc cancel",
+        Mode::KeyEntry => "  type the code   Tab next field   Enter continue   Esc cancel",
         Mode::Working => "  working: do not close this window",
         Mode::Done => "  Enter continue",
         Mode::RuleInfo if app.can_change() => match app.browser.as_ref().and_then(|b| b.selected()) {
@@ -546,6 +548,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
         Action::Rule(crate::admin::Verb::Disable, sid) => format!("Disable rule {sid}?"),
         Action::Rule(crate::admin::Verb::Enable, sid) => format!("Enable rule {sid}?"),
         Action::Update => "Update the rules now?".to_string(),
+        Action::SourceKey { name, .. } => format!("Store the code and switch on {name}?"),
         Action::Source { enable: true, name } => format!("Switch on the source {name}?"),
         Action::Source { enable: false, name } => format!("Switch off the source {name}?"),
         Action::Suppress { add: true, sid, track, ip } => format!(
@@ -560,7 +563,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
         Line::default(),
         Line::from(match &p.action {
             Action::Suppress { .. } => format!("This {}; Suricata checks the new file and reloads it live.", p.how),
-            Action::Source { .. } => format!("This {}.", p.how),
+            Action::Source { .. } | Action::SourceKey { .. } => format!("This {}.", p.how),
             _ => format!("This {}, rebuilds the rules and reloads Suricata live.", p.how),
         }),
         Line::from(match &p.action {
@@ -640,6 +643,7 @@ fn draw_working(f: &mut Frame, app: &App, area: Rect) {
             match &j.action {
                 Action::Rule(v, sid) => format!("{} rule {sid}", v.word()),
                 Action::Update => "updating the rules".to_string(),
+                Action::SourceKey { name, .. } => format!("storing the code for {name} and installing its rules"),
                 Action::Source { enable, name } => {
                     format!("{} the source {name}", if *enable { "switching on" } else { "switching off" })
                 }
@@ -694,7 +698,7 @@ fn draw_sources(f: &mut Frame, app: &App, area: Rect) {
     if let Some(e) = &v.error {
         return f.render_widget(Paragraph::new(format!("Could not read the sources: {e}")), area);
     }
-    let sel = app.src_sel.min((v.enabled.len() + v.free.len()).saturating_sub(1));
+    let sel = app.src_sel.min((v.enabled.len() + v.free.len() + v.keyed.len()).saturating_sub(1));
     // (line, is the selected row)
     let mut rows: Vec<(Line<'static>, bool)> = Vec::new();
     let head = |t: String| (Line::from(Span::styled(fit(&t, w), header_style())), false);
@@ -715,17 +719,38 @@ fn draw_sources(f: &mut Frame, app: &App, area: Rect) {
         rows.push(item(s, v.enabled.len() + i));
     }
     rows.push((Line::default(), false));
-    rows.push(head(format!("Need a key or subscription ({})", v.keyed.len())));
-    for s in &v.keyed {
-        rows.push((Line::from(Span::styled(fit(&source_text(s), w), Style::default().add_modifier(Modifier::DIM))), false));
+    rows.push(head(format!("Need a key or subscription ({})   e asks for the code", v.keyed.len())));
+    for (i, s) in v.keyed.iter().enumerate() {
+        rows.push(item(s, v.enabled.len() + v.free.len() + i));
     }
     rows.push((Line::default(), false));
-    rows.push((Line::from("Keys are not supported yet. R fetches the current source list from the internet."), false));
+    rows.push((Line::from("R fetches the current source list from the internet."), false));
     let at = rows.iter().position(|(_, s)| *s).unwrap_or(0);
     let top = if h == 0 || at < h { 0 } else { at + 1 - h };
     let mut lines = vec![Line::from(Span::styled(fit("Rule sources", w), header_style()))];
     lines.extend(rows.into_iter().skip(top).take(h).map(|(l, _)| l));
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_key_entry(f: &mut Frame, app: &App, area: Rect) {
+    let Some(e) = &app.key_entry else {
+        return f.render_widget(Paragraph::new("Nothing to enter."), area);
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(format!("Code for {}", e.name), Style::default().add_modifier(Modifier::BOLD))),
+        plain(&e.summary),
+        Line::default(),
+    ];
+    for (i, (label, value, masked)) in e.fields.iter().enumerate() {
+        let shown = if *masked { "*".repeat(value.chars().count()) } else { value.clone() };
+        let cursor = if i == e.idx { "_" } else { "" };
+        lines.push(Line::from(Span::styled(label.clone(), header_style())));
+        lines.push(Line::from(format!("  {shown}{cursor}")));
+        lines.push(Line::default());
+    }
+    lines.push(Line::from("The code is shown as stars, is sent to the helper through a pipe (never on a command line)"));
+    lines.push(Line::from("and is kept only in a file that root can read. Nothing is stored until you confirm."));
+    scroll_screen(f, app, area, "Source code", lines);
 }
 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
@@ -748,7 +773,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("5, x", "suppress list; x removes the highlighted entry"),
         ("6 / 7", "settings (read-only) / logs (Tab: next log)"),
         ("d / e", "disable / enable a rule: rules list, rule screen; d on an alert (router)"),
-        ("3, j k, e / d", "sources: move, switch the highlighted free source on / off; R refreshes the list"),
+        ("3, j k, e / d", "sources: move, switch on (e; asks for a code if needed) / off (d); R refreshes the list"),
         ("y", "confirm a change (Esc cancels)"),
         ("/ s c", "rules: search / state filter / clear"),
         ("?", "this help"),
@@ -1966,13 +1991,17 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
             Ok(vec![])
         }
         fn sources(&self, _refresh: bool) -> Result<Vec<String>, String> {
-            Ok("Enabled sources:\n  - et/open\n=====index=====\nName: et/open\n  Summary: ET Open\n  License: MIT\nName: abuse.ch/urlhaus\n  Summary: URLhaus rules\n  License: CC0-1.0\nName: et/pro\n  License: Commercial\n  Parameters: secret-code\n"
+            Ok("Enabled sources:\n  - et/open\n=====index=====\nName: et/open\n  Summary: ET Open\n  License: MIT\nName: abuse.ch/urlhaus\n  Summary: URLhaus rules\n  License: CC0-1.0\nName: et/pro\n  License: Commercial\n  Parameters: secret-code\nName: snort-registered\n  Summary: Snort registered rules\n  License: Registered\n  Parameters: oinkcode\nName: odd/two\n  License: Commercial\n  Parameters: user, secret-code\n"
                 .lines()
                 .map(str::to_string)
                 .collect())
         }
         fn source(&self, enable: bool, name: &str) -> Result<Vec<String>, String> {
             self.calls.lock().unwrap().push(format!("{enable} {name}"));
+            Ok(vec!["rules updated".to_string()])
+        }
+        fn source_key(&self, name: &str, snapshot: Option<&str>, key: &str) -> Result<Vec<String>, String> {
+            self.calls.lock().unwrap().push(format!("key {name} {snapshot:?} {key}"));
             Ok(vec!["rules updated".to_string()])
         }
         fn reload(&self) -> Result<(RuleIndex, DisableConf), String> {
@@ -1989,7 +2018,7 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         key(&mut a, '3');
         assert_eq!(a.mode, Mode::Sources);
         let s = screen(&a, 110, 20);
-        assert!(s.contains("Free sources available (1)") && s.contains("Need a key or subscription (1)"), "{s}");
+        assert!(s.contains("Free sources available (1)") && s.contains("Need a key or subscription (3)"), "{s}");
         // et/open (enabled) is highlighted first: e says it is already on, d asks.
         key(&mut a, 'e');
         assert_eq!(a.mode, Mode::Sources);
@@ -2011,6 +2040,82 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         assert_eq!(*fake.calls.lock().unwrap(), vec!["true abuse.ch/urlhaus".to_string()]);
         press(&mut a, KeyCode::Enter);
         assert_eq!(a.mode, Mode::Sources);
+    }
+
+    fn type_text(a: &mut App, t: &str) {
+        for c in t.chars() {
+            key(a, c);
+        }
+    }
+
+    #[test]
+    fn a_key_is_typed_masked_confirmed_and_sent_without_being_shown() {
+        let mut a = rules_app();
+        let fake = Arc::new(FakeSrc { calls: Default::default() });
+        a.set_admin(fake.clone());
+        press(&mut a, KeyCode::Esc);
+        key(&mut a, '3');
+        // enabled: et/open; free: urlhaus-less list has none but et/open is enabled; keyed: et/pro, snort, odd/two
+        let items: Vec<String> = a.source_items().iter().map(|(s, _)| s.name.clone()).collect();
+        let pro = items.iter().position(|n| n == "et/pro").unwrap();
+        for _ in 0..pro {
+            key(&mut a, 'j');
+        }
+        key(&mut a, 'e');
+        assert_eq!(a.mode, Mode::KeyEntry);
+        type_text(&mut a, "bad");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::KeyEntry);
+        assert!(a.status.contains("8 to 128"), "{}", a.status);
+        type_text(&mut a, "SECRETKEY123");
+        let s = screen(&a, 100, 16);
+        assert!(s.contains("Code for et/pro") && s.contains("***************"), "{s}");
+        assert!(!s.contains("SECRETKEY"), "{s}");
+        assert!(!format!("{:?}", a.key_entry).contains("SECRET"));
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Confirm);
+        let s = screen(&a, 110, 20);
+        assert!(s.contains("Store the code and switch on et/pro?") && !s.contains("SECRETKEY"), "{s}");
+        assert!(!format!("{:?}", a.pending).contains("SECRET"));
+        key(&mut a, 'y');
+        for _ in 0..200 {
+            a.poll_job();
+            if a.mode == Mode::Done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(a.mode, Mode::Done);
+        assert_eq!(*fake.calls.lock().unwrap(), vec!["key et/pro None badSECRETKEY123".to_string()]);
+        assert!(a.key_entry.is_none());
+    }
+
+    #[test]
+    fn snort_asks_for_the_snapshot_first_and_odd_sources_are_refused() {
+        let mut a = rules_app();
+        a.set_admin(Arc::new(FakeSrc { calls: Default::default() }));
+        press(&mut a, KeyCode::Esc);
+        key(&mut a, '3');
+        let items: Vec<String> = a.source_items().iter().map(|(s, _)| s.name.clone()).collect();
+        let snort = items.iter().position(|n| n == "snort-registered").unwrap();
+        for _ in 0..snort {
+            key(&mut a, 'j');
+        }
+        key(&mut a, 'e');
+        assert_eq!(a.mode, Mode::KeyEntry);
+        type_text(&mut a, "29200");
+        press(&mut a, KeyCode::Enter); // next field
+        type_text(&mut a, "0123456789abcdef");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::Sources);
+        assert!(a.key_entry.is_none());
+        let odd = items.iter().position(|n| n == "odd/two").unwrap();
+        for _ in snort..odd {
+            key(&mut a, 'j');
+        }
+        key(&mut a, 'e');
+        assert_eq!(a.mode, Mode::Sources);
+        assert!(a.status.contains("by hand"), "{}", a.status);
     }
 
     // ---- Updates screen ----

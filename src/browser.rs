@@ -219,6 +219,8 @@ pub struct Source {
     pub license: String,
     pub needs_key: bool,
     pub replaces: Option<String>,
+    /// Names from the index's `Parameters:` line (e.g. `secret-code`).
+    pub params: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -277,7 +279,10 @@ pub fn parse_sources(text: &str) -> Vec<Source> {
                         s.license = v;
                     }
                     "Replaces" => s.replaces = Some(v),
-                    "Parameters" => params = true,
+                    "Parameters" => {
+                        params = true;
+                        s.params = v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+                    }
                     "Subscription" => s.needs_key = true,
                     _ => {}
                 }

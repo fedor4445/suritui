@@ -30,6 +30,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         search_key(app, key.code);
         return false;
     }
+    if app.mode == Mode::KeyEntry {
+        match key.code {
+            KeyCode::Char(c) => app.key_char(c),
+            KeyCode::Backspace => app.key_backspace(),
+            KeyCode::Tab | KeyCode::Down => app.key_next(),
+            KeyCode::Enter => app.key_submit(),
+            KeyCode::Esc => app.key_cancel(),
+            _ => {}
+        }
+        return false;
+    }
     if key.code == KeyCode::Char('q') {
         return true;
     }

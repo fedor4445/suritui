@@ -9,6 +9,8 @@
 //!   suritui-admin alerts live | day K
 //!   suritui-admin sources [refresh]
 //!   suritui-admin source enable|disable NAME
+//!   suritui-admin source key NAME          (the key on stdin, never on the command line)
+//!   suritui-admin source snort SNAPSHOT    (the oinkcode on stdin)
 //!   suritui-admin disable SID
 //!   suritui-admin enable SID
 //!
@@ -21,8 +23,16 @@ use suritui::update::{apply_update, info};
 use suritui::source::Range;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: suritui-admin status | info | log suricata|update|admin | update | suppress|unsuppress SID by_src|by_dst IP | rules | sources [refresh] | source enable|disable NAME | alerts live | alerts day K | disable SID | enable SID");
+    eprintln!("usage: suritui-admin status | info | log suricata|update|admin | update | suppress|unsuppress SID by_src|by_dst IP | rules | sources [refresh] | source enable|disable NAME | source key NAME | source snort SNAPSHOT | alerts live | alerts day K | disable SID | enable SID");
     ExitCode::from(2)
+}
+
+/// One line from stdin: the key. Never taken from the arguments, where `ps` shows it.
+fn read_key() -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().take(300).read_to_string(&mut buf).map_err(|e| format!("cannot read the key: {e}"))?;
+    Ok(buf.trim_end_matches(['\n', '\r']).to_string())
 }
 
 fn main() -> ExitCode {
@@ -68,6 +78,14 @@ fn main() -> ExitCode {
         ["source", verb @ ("enable" | "disable"), name] => {
             suritui::sources::change(&paths, &runner, *verb == "enable", name)
         }
+        ["source", "key", name] => match read_key() {
+            Ok(k) => suritui::sources::set_key(&paths, &runner, name, None, &k),
+            Err(e) => Err(e),
+        },
+        ["source", "snort", snapshot] => match read_key() {
+            Ok(k) => suritui::sources::set_key(&paths, &runner, suritui::sources::SNORT, Some(snapshot), &k),
+            Err(e) => Err(e),
+        },
         [verb @ ("suppress" | "unsuppress"), sid, track, ip] => {
             let (Some(sid), Some(track)) = (parse_sid(sid), Track::parse(track)) else {
                 eprintln!("suritui-admin: not a valid sid or track (by_src | by_dst)");
@@ -88,12 +106,12 @@ fn main() -> ExitCode {
     match result {
         Ok(rep) => {
             for l in rep.lines {
-                println!("{l}");
+                println!("{}", suritui::sources::redact(&paths, &l));
             }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("suritui-admin: {e}");
+            eprintln!("suritui-admin: {}", suritui::sources::redact(&paths, &e));
             ExitCode::from(1)
         }
     }

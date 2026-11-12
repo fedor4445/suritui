@@ -12,6 +12,16 @@ use std::time::Instant;
 
 pub use crate::local::HELPER;
 
+/// A key being passed to the helper. Never printed: Debug hides it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
+
 /// What can be started from the TUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -22,6 +32,9 @@ pub enum Action {
     Update,
     /// Switch a free rule source on or off, then install the new rule set.
     Source { enable: bool, name: String },
+    /// Store a key for a source that needs one and switch it on. `snapshot` is
+    /// the Snort snapshot number (Snort only).
+    SourceKey { name: String, snapshot: Option<String>, key: Secret },
 }
 
 /// What the user is being asked to confirm.
@@ -52,6 +65,10 @@ pub trait Admin: Send + Sync {
     fn source(&self, _enable: bool, _name: &str) -> Result<Vec<String>, String> {
         Err("changing sources is not available here".to_string())
     }
+    /// Store a key and switch the source on.
+    fn source_key(&self, _name: &str, _snapshot: Option<&str>, _key: &str) -> Result<Vec<String>, String> {
+        Err("keys are not available here".to_string())
+    }
     /// The text of the Updates screen.
     fn info(&self) -> Result<Vec<String>, String> {
         Err("no status is available here".to_string())
@@ -77,6 +94,7 @@ pub trait Admin: Send + Sync {
             Action::Rule(v, sid) => self.change(*v, *sid),
             Action::Update => self.update(),
             Action::Source { enable, name } => self.source(*enable, name),
+            Action::SourceKey { name, snapshot, key } => self.source_key(name, snapshot.as_deref(), &key.0),
             Action::Suppress { add, sid, track, ip } => self.suppress(*add, *sid, *track, ip),
         }
     }
@@ -86,12 +104,27 @@ pub trait Admin: Send + Sync {
 
 /// `sudo -n <helper> <args>`; Ok(stdout lines) or Err(one line of stderr).
 fn run_helper(args: &[&str]) -> Result<Vec<String>, String> {
-    let out = Command::new("sudo")
+    run_helper_with(args, None)
+}
+
+/// Like `run_helper`; `stdin` goes to the helper's standard input (a key must
+/// never be an argument: `ps` shows those).
+fn run_helper_with(args: &[&str], stdin: Option<&str>) -> Result<Vec<String>, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("sudo")
         .arg("-n")
         .arg(HELPER)
         .args(args)
-        .output()
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("cannot run sudo: {e}"))?;
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let _ = writeln!(pipe, "{text}");
+    }
+    let out = child.wait_with_output().map_err(|e| format!("cannot run sudo: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     if out.status.success() {
@@ -135,6 +168,13 @@ impl Admin for LocalAdmin {
 
     fn source(&self, enable: bool, name: &str) -> Result<Vec<String>, String> {
         run_helper(&["source", if enable { "enable" } else { "disable" }, name])
+    }
+
+    fn source_key(&self, name: &str, snapshot: Option<&str>, key: &str) -> Result<Vec<String>, String> {
+        match snapshot {
+            Some(v) => run_helper_with(&["source", "snort", v], Some(key)),
+            None => run_helper_with(&["source", "key", name], Some(key)),
+        }
     }
 
     fn suppress(&self, add: bool, sid: u64, track: Track, ip: &str) -> Result<Vec<String>, String> {

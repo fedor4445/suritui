@@ -288,6 +288,8 @@ pub struct Paths {
     pub log: PathBuf,
     pub suricata_update: String,
     pub suricatasc: String,
+    /// suricata-update's sources directory (holds the keys).
+    pub sources_dir: PathBuf,
     pub require_root: bool,
     /// How long to wait for a started reload to finish.
     pub reload_wait_secs: u64,
@@ -314,6 +316,7 @@ impl Paths {
             log: "/var/log/suritui-admin.log".into(),
             suricata_update: "/usr/local/bin/suricata-update".into(),
             suricatasc: "/usr/local/bin/suricatasc".into(),
+            sources_dir: "/var/lib/suricata/update/sources".into(),
             require_root: true,
             reload_wait_secs: 180,
         }
@@ -808,6 +811,8 @@ pub fn read_log<W: std::io::Write>(paths: &Paths, name: &str, w: &mut W) -> Resu
             text.drain(..=i);
         }
     }
+    // A failed download is logged with its whole URL; hide any stored key in it.
+    let text = crate::sources::redact(paths, &text);
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(LOG_TAIL_LINES);
     for l in &lines[start..] {
@@ -1122,6 +1127,7 @@ mod tests {
             log: d.join("log"),
             suricata_update: "su".into(),
             suricatasc: "sc".into(),
+            sources_dir: d.join("sources"),
             require_root: false,
             reload_wait_secs: 0,
         };
