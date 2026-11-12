@@ -2023,6 +2023,7 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         key(&mut a, 'e');
         assert_eq!(a.mode, Mode::Sources);
         assert!(a.status.contains("already enabled"), "{}", a.status);
+        assert!(screen(&a, 110, 20).contains("rule sources | this source is already enabled"));
         key(&mut a, 'j');
         key(&mut a, 'e');
         assert_eq!(a.mode, Mode::Confirm);

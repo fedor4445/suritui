@@ -1048,8 +1048,9 @@ impl App {
             }
             return s;
         }
-        if self.mode == Mode::Sources {
-            return "rule sources".to_string();
+        if matches!(self.mode, Mode::Sources | Mode::KeyEntry) {
+            let base = if self.mode == Mode::Sources { "rule sources" } else { "source code" };
+            return if self.status.is_empty() { base.to_string() } else { format!("{base} | {}", self.status) };
         }
         if matches!(self.mode, Mode::Confirm | Mode::Working | Mode::Done) {
             return self.status.clone();
