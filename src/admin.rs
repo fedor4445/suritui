@@ -15,7 +15,9 @@ use std::process::Command;
 /// More flips than this besides the target means something is off.
 pub const MAX_EXTRA_FLIPS: usize = 25;
 /// Backups kept (newest first).
-pub const KEEP_BACKUPS: usize = 10;
+pub const KEEP_BACKUPS: usize = 5;
+/// A rebuild that takes longer than this is killed (the daily one takes ~2 minutes).
+pub const REBUILD_TIMEOUT_SECS: &str = "900";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
@@ -448,9 +450,9 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
     let build_dir = paths.build_dir.to_string_lossy().into_owned();
     let cand_dc_s = cand_dc.to_string_lossy().into_owned();
     let o = runner.run(
-        "/usr/bin/nice",
+        "/usr/bin/timeout",
         &[
-            "-n", "15", &paths.suricata_update, "--offline", "--no-reload", "--disable-conf", &cand_dc_s, "-o", &build_dir,
+            REBUILD_TIMEOUT_SECS, "/usr/bin/nice", "-n", "15", &paths.suricata_update, "--offline", "--no-reload", "--disable-conf", &cand_dc_s, "-o", &build_dir,
         ],
     )?;
     if o.code != Some(0) {
@@ -689,7 +691,7 @@ mod tests {
                 "/bin/pgrep" if args[0] == "-f" => out(if self.update_running { 0 } else { 1 }, ""),
                 "/bin/pgrep" => out(if self.alive { 0 } else { 1 }, ""),
                 "/bin/ps" => out(1, ""),
-                "/usr/bin/nice" => {
+                "/usr/bin/timeout" => {
                     let dir = args[args.iter().position(|a| *a == "-o").unwrap() + 1];
                     match &self.rebuild {
                         Rebuild::Rules(t) => {
@@ -816,7 +818,7 @@ mod tests {
         let f = Fake::ok(String::new());
         let rep = apply(&p, &f, Verb::Disable, 100).unwrap();
         assert!(rep.lines[0].contains("nothing changed"));
-        assert!(!calls(&f).contains("nice"));
+        assert!(!calls(&f).contains("timeout"));
         assert!(!p.backup_root.exists());
     }
 
@@ -835,7 +837,7 @@ mod tests {
         p2.require_root = true;
         assert!(apply(&p2, &f, Verb::Disable, 100).unwrap_err().contains("must run as root"));
         assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
-        assert!(!calls(&f).contains("nice"));
+        assert!(!calls(&f).contains("timeout"));
     }
 
     #[test]
