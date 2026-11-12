@@ -307,6 +307,11 @@ pub(crate) fn update_locked(paths: &Paths, runner: &dyn Runner, strict: bool) ->
         &mut rep,
         format!("rules updated: {added} added, {removed} removed, {changed} changed; Suricata reloaded"),
     );
+    let (on_before, on_after) = (l.values().filter(|v| v.0).count(), c.values().filter(|v| v.0).count());
+    say(&mut rep, format!("rules switched on: {} before, {} now", group(on_before), group(on_after)));
+    if added > 0 && on_after <= on_before {
+        say(&mut rep, "the new rules are all switched off by default; turn on the ones you want in the Rules screen");
+    }
     Ok(rep)
 }
 
