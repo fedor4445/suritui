@@ -57,46 +57,81 @@ fn line_sid(line: &str) -> Option<u64> {
     parse_sid(first.rsplit(':').next()?)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Edit {
-    /// Nothing to write: disable.conf already says it.
-    NoChange(String),
-    /// New file text.
-    Write(String),
+fn lists(text: &str, sid: u64) -> bool {
+    text.lines().any(|l| line_sid(l) == Some(sid))
 }
 
-/// Build the candidate disable.conf. Pure: no I/O.
-pub fn candidate_disable_conf(text: &str, verb: Verb, sid: u64, date: &str) -> Result<Edit, String> {
-    let listed = text.lines().any(|l| line_sid(l) == Some(sid));
+/// The text with every plain line naming `sid` removed.
+fn without_sid(text: &str, sid: u64) -> String {
+    let mut out = String::new();
+    for line in text.lines().filter(|l| line_sid(l) != Some(sid)) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The text with a line for `sid` appended.
+fn with_sid(text: &str, sid: u64, date: &str) -> String {
+    let mut out = text.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("{sid}  # suritui {date}\n"));
+    out
+}
+
+/// New full texts for disable.conf and enable.conf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub disable: String,
+    pub enable: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// The files already say it.
+    NoChange(String),
+    /// Candidates to try in order; the first whose rebuild flips the rule wins.
+    Try(Vec<Candidate>),
+}
+
+/// Decide which edits to try. Pure: no I/O. The aim is the smallest edit, so
+/// that disable followed by enable (or the reverse) restores the files exactly:
+///   disable: add the sid to disable.conf, or take it back out of enable.conf;
+///   enable:  take the sid out of disable.conf, or add it to enable.conf when a
+///            group or the source keeps it off.
+pub fn plan_change(dc: &str, ec: &str, verb: Verb, sid: u64, date: &str) -> Plan {
+    let (d, e) = (lists(dc, sid), lists(ec, sid));
+    let cand = |disable: String, enable: String| Candidate { disable, enable };
     match verb {
         Verb::Disable => {
-            if listed {
-                return Ok(Edit::NoChange(format!(
-                    "sid {sid} is already listed in disable.conf"
-                )));
+            if e {
+                let mut v = vec![cand(dc.to_string(), without_sid(ec, sid))];
+                if !d {
+                    // It was on by default as well: list it in disable.conf too.
+                    v.push(cand(with_sid(dc, sid, date), without_sid(ec, sid)));
+                }
+                Plan::Try(v)
+            } else if d {
+                Plan::NoChange(format!("sid {sid} is already listed in disable.conf"))
+            } else {
+                Plan::Try(vec![cand(with_sid(dc, sid, date), ec.to_string())])
             }
-            let mut out = text.to_string();
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(&format!("{sid}  # suritui {date}\n"));
-            Ok(Edit::Write(out))
         }
         Verb::Enable => {
-            if !listed {
-                return Err(format!(
-                    "sid {sid} is not listed in disable.conf by number, so removing a line cannot enable it \
-                     (it is disabled by a group or pattern, or off in the rule source)"
-                ));
-            }
-            let mut out = String::new();
-            for line in text.lines() {
-                if line_sid(line) != Some(sid) {
-                    out.push_str(line);
-                    out.push('\n');
+            if d {
+                let mut v = vec![cand(without_sid(dc, sid), ec.to_string())];
+                if !e {
+                    // A group keeps it off as well: enable.conf overrides that.
+                    v.push(cand(without_sid(dc, sid), with_sid(ec, sid, date)));
                 }
+                Plan::Try(v)
+            } else if e {
+                Plan::NoChange(format!("sid {sid} is already listed in enable.conf"))
+            } else {
+                Plan::Try(vec![cand(dc.to_string(), with_sid(ec, sid, date))])
             }
-            Ok(Edit::Write(out))
         }
     }
 }
@@ -112,21 +147,37 @@ fn rule_map(text: &str) -> HashMap<u64, (bool, String)> {
     m
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum DiffError {
+    /// The rebuild left the target in its old state: the next candidate may do it.
+    TargetUnchanged(String),
+    Other(String),
+}
+
+impl std::fmt::Display for DiffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiffError::TargetUnchanged(m) | DiffError::Other(m) => write!(f, "{m}"),
+        }
+    }
+}
+
 /// Compare the live rules with the rebuilt candidate. Ok(other sids whose state
 /// also flipped, sorted) when the only differences are the target's state and a
 /// few flowbit dependents; Err(reason) for anything else.
-pub fn check_rule_diff(live: &str, cand: &str, sid: u64, verb: Verb) -> Result<Vec<u64>, String> {
+pub fn check_rule_diff(live: &str, cand: &str, sid: u64, verb: Verb) -> Result<Vec<u64>, DiffError> {
+    let other = |m: String| DiffError::Other(m);
     let (l, c) = (rule_map(live), rule_map(cand));
     if l.is_empty() {
-        return Err("the live rules file has no rules; refusing to continue".into());
+        return Err(other("the live rules file has no rules; refusing to continue".into()));
     }
     let added = c.keys().filter(|k| !l.contains_key(k)).count();
     let removed = l.keys().filter(|k| !c.contains_key(k)).count();
     if added > 0 || removed > 0 {
-        return Err(format!(
+        return Err(other(format!(
             "the rebuilt rules add {added} and remove {removed} rules; the cache is not what produced the live \
              rules. Run the daily update first"
-        ));
+        )));
     }
     let mut flips = Vec::new();
     let mut text_changed = 0;
@@ -140,32 +191,32 @@ pub fn check_rule_diff(live: &str, cand: &str, sid: u64, verb: Verb) -> Result<V
         }
     }
     if text_changed > 0 {
-        return Err(format!(
+        return Err(other(format!(
             "{text_changed} rules changed text; the cache is not what produced the live rules. Run the daily update first"
-        ));
+        )));
     }
     let Some((live_state, _)) = l.get(&sid) else {
-        return Err(format!("sid {sid} is not in the live rules"));
+        return Err(other(format!("sid {sid} is not in the live rules")));
     };
     let want = verb.wants_enabled();
     let cand_state = c[&sid].0;
     if cand_state != want {
-        return Err(format!(
+        return Err(DiffError::TargetUnchanged(format!(
             "after the rebuild sid {sid} is still {} (a rule that other enabled rules depend on through flowbits \
-             cannot be turned off this way)",
+             cannot be turned off, and a rule switched off by a group needs enable.conf)",
             if cand_state { "enabled" } else { "disabled" }
-        ));
+        )));
     }
     if *live_state == want && flips.contains(&sid) {
-        return Err("internal inconsistency in the diff".into());
+        return Err(other("internal inconsistency in the diff".into()));
     }
     let mut extra: Vec<u64> = flips.into_iter().filter(|k| *k != sid).collect();
     extra.sort_unstable();
     if extra.len() > MAX_EXTRA_FLIPS {
-        return Err(format!(
+        return Err(other(format!(
             "{} other rules would change state (limit {MAX_EXTRA_FLIPS}); refusing",
             extra.len()
-        ));
+        )));
     }
     Ok(extra)
 }
@@ -222,6 +273,7 @@ impl Runner for SystemRunner {
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub disable_conf: PathBuf,
+    pub enable_conf: PathBuf,
     pub rules: PathBuf,
     pub build_dir: PathBuf,
     pub backup_root: PathBuf,
@@ -237,6 +289,7 @@ impl Paths {
     pub fn production() -> Paths {
         Paths {
             disable_conf: "/usr/local/etc/suricata/disable.conf".into(),
+            enable_conf: "/usr/local/etc/suricata/enable.conf".into(),
             rules: "/var/lib/suricata/rules/suricata.rules".into(),
             // Root-only parents: the suricata user must never be able to plant
             // a symlink that the root helper would write through.
@@ -409,6 +462,32 @@ fn reload(paths: &Paths, runner: &dyn Runner) -> Result<(), String> {
     }
 }
 
+/// Build the rules for one candidate into the scratch directory and return them.
+fn rebuild(paths: &Paths, runner: &dyn Runner, cand: &Candidate) -> Result<String, String> {
+    let _ = fs::remove_dir_all(&paths.build_dir);
+    fs::create_dir_all(&paths.build_dir).map_err(|e| io("cannot create the build directory", e))?;
+    let cand_dc = paths.build_dir.join("disable.conf");
+    let cand_ec = paths.build_dir.join("enable.conf");
+    fs::write(&cand_dc, &cand.disable).map_err(|e| io("cannot write the candidate", e))?;
+    // Always passed explicitly so a stale live enable.conf cannot leak into the build.
+    let ec_text = if cand.enable.trim().is_empty() { "# none\n" } else { cand.enable.as_str() };
+    fs::write(&cand_ec, ec_text).map_err(|e| io("cannot write the candidate", e))?;
+    let build_dir = paths.build_dir.to_string_lossy().into_owned();
+    let (dc_s, ec_s) = (cand_dc.to_string_lossy().into_owned(), cand_ec.to_string_lossy().into_owned());
+    let o = runner.run(
+        "/usr/bin/timeout",
+        &[
+            REBUILD_TIMEOUT_SECS, "/usr/bin/nice", "-n", "15", &paths.suricata_update, "--offline", "--no-reload",
+            "--disable-conf", &dc_s, "--enable-conf", &ec_s, "-o", &build_dir,
+        ],
+    )?;
+    if o.code != Some(0) {
+        let tail: Vec<&str> = o.stdout.lines().chain(o.stderr.lines()).rev().take(3).collect();
+        return Err(format!("the rebuild failed (exit {:?}): {}", o.code, tail.join(" | ")));
+    }
+    fs::read_to_string(paths.build_dir.join("suricata.rules")).map_err(|e| io("the rebuild produced no rules file", e))
+}
+
 /// Disable or enable one rule. Nothing changes unless every check passes; if the
 /// reload fails the previous files are put back and reloaded again.
 pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result<Report, String> {
@@ -428,53 +507,56 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
 
     let rules_meta = plain_file(&paths.rules)?;
     let dc_meta = plain_file(&paths.disable_conf)?;
+    let ec_exists = paths.enable_conf.exists() || fs::symlink_metadata(&paths.enable_conf).is_ok();
+    let ec_meta = if ec_exists { plain_file(&paths.enable_conf)? } else { dc_meta.clone() };
     let live_rules = fs::read_to_string(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
     if !rule_map(&live_rules).contains_key(&sid) {
         return Err(format!("sid {sid} is not in the live rules"));
     }
     let dc_text = fs::read_to_string(&paths.disable_conf).map_err(|e| io("cannot read disable.conf", e))?;
-    let new_dc = match candidate_disable_conf(&dc_text, verb, sid, &ymd(now()))? {
-        Edit::NoChange(msg) => {
+    let ec_text = if ec_exists {
+        fs::read_to_string(&paths.enable_conf).map_err(|e| io("cannot read enable.conf", e))?
+    } else {
+        String::new()
+    };
+    let candidates = match plan_change(&dc_text, &ec_text, verb, sid, &ymd(now())) {
+        Plan::NoChange(msg) => {
             say(&mut rep, format!("{msg}; nothing changed"));
             return Ok(rep);
         }
-        Edit::Write(t) => t,
+        Plan::Try(c) => c,
     };
 
-    // 2. rebuild into a scratch directory, never into the live one
-    let _ = fs::remove_dir_all(&paths.build_dir);
-    fs::create_dir_all(&paths.build_dir).map_err(|e| io("cannot create the build directory", e))?;
+    // 2./3. rebuild each candidate into a scratch directory (never the live one)
+    // and check it against the live rules; the first that really flips the rule wins.
     let cleanup = |p: &Paths| {
         let _ = fs::remove_dir_all(&p.build_dir);
     };
-    let cand_dc = paths.build_dir.join("disable.conf");
-    fs::write(&cand_dc, &new_dc).map_err(|e| io("cannot write the candidate", e))?;
-    let build_dir = paths.build_dir.to_string_lossy().into_owned();
-    let cand_dc_s = cand_dc.to_string_lossy().into_owned();
-    let o = runner.run(
-        "/usr/bin/timeout",
-        &[
-            REBUILD_TIMEOUT_SECS, "/usr/bin/nice", "-n", "15", &paths.suricata_update, "--offline", "--no-reload", "--disable-conf", &cand_dc_s, "-o", &build_dir,
-        ],
-    )?;
-    if o.code != Some(0) {
-        cleanup(paths);
-        let tail: Vec<&str> = o.stdout.lines().chain(o.stderr.lines()).rev().take(3).collect();
-        return Err(format!("the rebuild failed (exit {:?}): {}", o.code, tail.join(" | ")));
-    }
-    let cand_rules_path = paths.build_dir.join("suricata.rules");
-    let cand_rules = fs::read_to_string(&cand_rules_path).map_err(|e| {
-        cleanup(paths);
-        io("the rebuild produced no rules file", e)
-    })?;
-
-    // 3. check the result against the live rules
-    let extra = match check_rule_diff(&live_rules, &cand_rules, sid, verb) {
-        Ok(x) => x,
-        Err(e) => {
-            cleanup(paths);
-            return Err(e);
+    let mut chosen: Option<(Candidate, String, Vec<u64>)> = None;
+    let mut last_err = String::from("no candidate worked");
+    for cand in &candidates {
+        let cand_rules = match rebuild(paths, runner, cand) {
+            Ok(t) => t,
+            Err(e) => {
+                cleanup(paths);
+                return Err(e);
+            }
+        };
+        match check_rule_diff(&live_rules, &cand_rules, sid, verb) {
+            Ok(extra) => {
+                chosen = Some((cand.clone(), cand_rules, extra));
+                break;
+            }
+            Err(DiffError::TargetUnchanged(m)) => last_err = m,
+            Err(DiffError::Other(m)) => {
+                cleanup(paths);
+                return Err(m);
+            }
         }
+    }
+    cleanup(paths);
+    let Some((cand, cand_rules, extra)) = chosen else {
+        return Err(last_err);
     };
 
     // Back up now that every check has passed (refused attempts leave nothing behind).
@@ -483,23 +565,48 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
     fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
     let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
     fs::copy(&paths.disable_conf, backup.join("disable.conf")).map_err(|e| io("backup of disable.conf", e))?;
+    if ec_exists {
+        fs::copy(&paths.enable_conf, backup.join("enable.conf")).map_err(|e| io("backup of enable.conf", e))?;
+    }
     fs::copy(&paths.rules, backup.join("suricata.rules")).map_err(|e| io("backup of the rules", e))?;
     say(&mut rep, format!("backup: {}", backup.display()));
 
-
-    // 4. install: staged next to the live files, then atomic renames. If the
-    // second one fails the first is undone from the originals held in memory.
-    let _ = fs::remove_dir_all(&paths.build_dir);
-    put(&paths.disable_conf, new_dc.as_bytes(), &dc_meta)?;
-    if let Err(e) = put(&paths.rules, cand_rules.as_bytes(), &rules_meta) {
-        let _ = put(&paths.disable_conf, dc_text.as_bytes(), &dc_meta);
-        return Err(format!("{e} (disable.conf restored)"));
-    }
+    // 4. install: staged next to the live files, then atomic renames. Whatever
+    // fails later is undone from the originals held in memory.
+    let write_enable = |p: &Paths, text: &str| -> Result<(), String> {
+        if text.trim().is_empty() {
+            // An empty enable.conf is the same as none; keep the directory tidy.
+            return match fs::remove_file(&p.enable_conf) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(io("remove enable.conf", e)),
+            };
+        }
+        put(&p.enable_conf, text.as_bytes(), &ec_meta)
+    };
     let restore = |p: &Paths| {
         let a = put(&p.disable_conf, dc_text.as_bytes(), &dc_meta);
-        let b = put(&p.rules, live_rules.as_bytes(), &rules_meta);
-        a.and(b)
+        let b = if ec_exists {
+            put(&p.enable_conf, ec_text.as_bytes(), &ec_meta)
+        } else {
+            write_enable(p, "")
+        };
+        let c = put(&p.rules, live_rules.as_bytes(), &rules_meta);
+        a.and(b).and(c)
     };
+    if cand.disable != dc_text {
+        put(&paths.disable_conf, cand.disable.as_bytes(), &dc_meta)?;
+    }
+    if cand.enable != ec_text {
+        if let Err(e) = write_enable(paths, &cand.enable) {
+            let _ = restore(paths);
+            return Err(format!("{e} (previous files restored)"));
+        }
+    }
+    if let Err(e) = put(&paths.rules, cand_rules.as_bytes(), &rules_meta) {
+        let _ = restore(paths);
+        return Err(format!("{e} (previous files restored)"));
+    }
 
     // 5. live reload; put everything back if Suricata does not take it
     let reloaded = reload(paths, runner);
@@ -618,6 +725,10 @@ pub fn status(paths: &Paths, runner: &dyn Runner) -> Report {
         .map(|t| t.lines().filter(|l| line_sid(l).is_some()).count())
         .unwrap_or(0);
     say(&mut rep, format!("disable.conf: {n} sids"));
+    let e = fs::read_to_string(&paths.enable_conf)
+        .map(|t| t.lines().filter(|l| line_sid(l).is_some()).count())
+        .unwrap_or(0);
+    say(&mut rep, format!("enable.conf: {e} sids"));
     let update = runner
         .run("/bin/pgrep", &["-f", "suricata-update"])
         .map(|o| o.code == Some(0))
@@ -655,25 +766,57 @@ mod tests {
         assert_eq!(ymd(951_782_400), "2000-02-29");
     }
 
-    #[test]
-    fn disable_appends_and_is_idempotent() {
-        let t = "# c\ngroup:x.rules\n5\n";
-        let Edit::Write(w) = candidate_disable_conf(t, Verb::Disable, 9, "2026-01-02").unwrap() else {
-            panic!()
-        };
-        assert_eq!(w, "# c\ngroup:x.rules\n5\n9  # suritui 2026-01-02\n");
-        assert!(matches!(candidate_disable_conf(t, Verb::Disable, 5, "d"), Ok(Edit::NoChange(_))));
-        let Edit::Write(w) = candidate_disable_conf("5", Verb::Disable, 9, "d").unwrap() else { panic!() };
-        assert!(w.starts_with("5\n9"));
+    fn c(dc: &str, ec: &str) -> Candidate {
+        Candidate { disable: dc.to_string(), enable: ec.to_string() }
     }
 
     #[test]
-    fn enable_removes_only_that_sid() {
+    fn disable_adds_to_disable_conf_and_is_idempotent() {
+        let t = "# c\ngroup:x.rules\n5\n";
+        let Plan::Try(v) = plan_change(t, "", Verb::Disable, 9, "2026-01-02") else { panic!() };
+        assert_eq!(v, vec![c("# c\ngroup:x.rules\n5\n9  # suritui 2026-01-02\n", "")]);
+        assert!(matches!(plan_change(t, "", Verb::Disable, 5, "d"), Plan::NoChange(_)));
+        let Plan::Try(v) = plan_change("5", "", Verb::Disable, 9, "d") else { panic!() };
+        assert!(v[0].disable.starts_with("5\n9"));
+    }
+
+    #[test]
+    fn enable_removes_only_that_sid_from_disable_conf_first() {
         let t = "# keep\n7\n1:9  # suritui d\n9x\ngroup:g.rules\n";
-        let Edit::Write(w) = candidate_disable_conf(t, Verb::Enable, 9, "d").unwrap() else { panic!() };
-        assert_eq!(w, "# keep\n7\n9x\ngroup:g.rules\n");
-        let e = candidate_disable_conf(t, Verb::Enable, 11, "d").unwrap_err();
-        assert!(e.contains("group or pattern"), "{e}");
+        let Plan::Try(v) = plan_change(t, "", Verb::Enable, 9, "D") else { panic!() };
+        assert_eq!(v[0], c("# keep\n7\n9x\ngroup:g.rules\n", ""));
+        // second candidate: a group keeps it off, so enable.conf is added too
+        assert_eq!(v[1], c("# keep\n7\n9x\ngroup:g.rules\n", "9  # suritui D\n"));
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn enable_of_a_group_disabled_rule_goes_to_enable_conf() {
+        let Plan::Try(v) = plan_change("group:g.rules\n", "", Verb::Enable, 11, "D") else { panic!() };
+        assert_eq!(v, vec![c("group:g.rules\n", "11  # suritui D\n")]);
+        assert!(matches!(plan_change("", "11\n", Verb::Enable, 11, "D"), Plan::NoChange(_)));
+    }
+
+    #[test]
+    fn disable_undoes_an_enable_conf_entry_exactly() {
+        let ec = "11  # suritui D\n";
+        let Plan::Try(v) = plan_change("group:g.rules\n", ec, Verb::Disable, 11, "D") else { panic!() };
+        assert_eq!(v[0], c("group:g.rules\n", ""));
+        // fallback when the rule is also on by default: list it in disable.conf too
+        assert_eq!(v[1], c("group:g.rules\n11  # suritui D\n", ""));
+    }
+
+    #[test]
+    fn round_trips_restore_the_texts() {
+        let dc = "# c\ngroup:g.rules\n";
+        // disable then enable
+        let Plan::Try(a) = plan_change(dc, "", Verb::Disable, 9, "D") else { panic!() };
+        let Plan::Try(b) = plan_change(&a[0].disable, &a[0].enable, Verb::Enable, 9, "D") else { panic!() };
+        assert_eq!(b[0], c(dc, ""));
+        // enable (via enable.conf) then disable
+        let Plan::Try(a) = plan_change(dc, "", Verb::Enable, 9, "D") else { panic!() };
+        let Plan::Try(b) = plan_change(&a[0].disable, &a[0].enable, Verb::Disable, 9, "D") else { panic!() };
+        assert_eq!(b[0], c(dc, ""));
     }
 
     #[test]
@@ -695,13 +838,15 @@ mod tests {
         let live = rules(&[R_ON, R2]);
         // target did not flip (flowbit keeps it enabled)
         let e = check_rule_diff(&live, &live, 100, Verb::Disable).unwrap_err();
+        assert!(matches!(e, DiffError::TargetUnchanged(_)));
+        let e = e.to_string();
         assert!(e.contains("still enabled"), "{e}");
         // a rule was removed
-        let e = check_rule_diff(&live, &rules(&[R_OFF]), 100, Verb::Disable).unwrap_err();
+        let e = check_rule_diff(&live, &rules(&[R_OFF]), 100, Verb::Disable).unwrap_err().to_string();
         assert!(e.contains("remove 1"), "{e}");
         // a rule changed text
         let changed = rules(&[R_OFF, &R2.replace("rev:1", "rev:2")]);
-        let e = check_rule_diff(&live, &changed, 100, Verb::Disable).unwrap_err();
+        let e = check_rule_diff(&live, &changed, 100, Verb::Disable).unwrap_err().to_string();
         assert!(e.contains("changed text"), "{e}");
         // unknown sid
         assert!(check_rule_diff(&live, &live, 999, Verb::Disable).is_err());
@@ -719,7 +864,7 @@ mod tests {
             }
             v.join("\n") + "\n"
         };
-        let e = check_rule_diff(&mk(false), &mk(true), 100, Verb::Enable).unwrap_err();
+        let e = check_rule_diff(&mk(false), &mk(true), 100, Verb::Enable).unwrap_err().to_string();
         assert!(e.contains("limit"), "{e}");
     }
 
@@ -727,6 +872,8 @@ mod tests {
 
     enum Rebuild {
         Rules(String),
+        /// One result per rebuild, in order.
+        Seq(RefCell<Vec<String>>),
         Fail,
     }
 
@@ -737,6 +884,8 @@ mod tests {
         alive: bool,
         rebuild: Rebuild,
         reloads: RefCell<Vec<bool>>,
+        /// enable.conf texts the rebuilds were given.
+        seen_enable: RefCell<Vec<String>>,
     }
 
     impl Fake {
@@ -748,6 +897,7 @@ mod tests {
                 alive: true,
                 rebuild: Rebuild::Rules(cand_rules),
                 reloads: RefCell::new(vec![true]),
+                seen_enable: RefCell::new(vec![]),
             }
         }
     }
@@ -766,8 +916,16 @@ mod tests {
                 "/bin/ps" => out(1, ""),
                 "/usr/bin/timeout" => {
                     let dir = args[args.iter().position(|a| *a == "-o").unwrap() + 1];
+                    if let Some(i) = args.iter().position(|a| *a == "--enable-conf") {
+                        self.seen_enable.borrow_mut().push(fs::read_to_string(args[i + 1]).unwrap());
+                    }
                     match &self.rebuild {
                         Rebuild::Rules(t) => {
+                            fs::write(Path::new(dir).join("suricata.rules"), t).unwrap();
+                            out(0, "")
+                        }
+                        Rebuild::Seq(q) => {
+                            let t = q.borrow_mut().remove(0);
                             fs::write(Path::new(dir).join("suricata.rules"), t).unwrap();
                             out(0, "")
                         }
@@ -797,6 +955,7 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         let p = Paths {
             disable_conf: d.join("disable.conf"),
+            enable_conf: d.join("enable.conf"),
             rules: d.join("suricata.rules"),
             build_dir: d.join("build"),
             backup_root: d.join("backups"),
@@ -942,7 +1101,7 @@ mod tests {
         let f = Fake::ok(String::new());
         let s = status(&p, &f).lines.join("\n");
         assert!(s.contains("suricata running: yes") && s.contains("2 loaded file, 1 disabled"), "{s}");
-        assert!(s.contains("disable.conf: 2 sids"), "{s}");
+        assert!(s.contains("disable.conf: 2 sids") && s.contains("enable.conf: 0 sids"), "{s}");
     }
 
     #[test]
@@ -1050,5 +1209,68 @@ mod tests {
         let mut out = Vec::new();
         read_rules(&p, &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), rules(&[R_ON]));
+    }
+
+    // ---- enable.conf ----
+
+    #[test]
+    fn enabling_a_group_disabled_rule_creates_enable_conf() {
+        let live = rules(&[R_OFF, R2]);
+        let (_t, p) = setup("ec-new", &live, "group:g.rules\n");
+        let f = Fake::ok(rules(&[R_ON, R2]));
+        let rep = apply(&p, &f, Verb::Enable, 100).unwrap();
+        assert!(rep.lines.iter().any(|l| l.contains("sid 100 enabled")), "{rep:?}");
+        assert!(fs::read_to_string(&p.enable_conf).unwrap().starts_with("100  # suritui"));
+        assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "group:g.rules\n");
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), rules(&[R_ON, R2]));
+        assert!(f.seen_enable.borrow()[0].contains("100  # suritui"), "the rebuild must be given the candidate");
+        assert_eq!(fs::metadata(&p.enable_conf).unwrap().mode() & 0o777, fs::metadata(&p.disable_conf).unwrap().mode() & 0o777);
+    }
+
+    #[test]
+    fn disabling_it_again_removes_enable_conf_and_restores_everything() {
+        let live = rules(&[R_OFF, R2]);
+        let (_t, p) = setup("ec-roundtrip", &live, "group:g.rules\n");
+        apply(&p, &Fake::ok(rules(&[R_ON, R2])), Verb::Enable, 100).unwrap();
+        assert!(p.enable_conf.exists());
+        apply(&p, &Fake::ok(rules(&[R_OFF, R2])), Verb::Disable, 100).unwrap();
+        assert!(!p.enable_conf.exists(), "an empty enable.conf is removed");
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
+        assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "group:g.rules\n");
+    }
+
+    #[test]
+    fn second_candidate_is_tried_when_a_group_also_keeps_it_off() {
+        // sid 100 is listed in disable.conf AND its group is disabled
+        let live = rules(&[R_OFF, R2]);
+        let (_t, p) = setup("ec-two", &live, "group:g.rules\n100\n");
+        let mut f = Fake::ok(String::new());
+        f.rebuild = Rebuild::Seq(RefCell::new(vec![rules(&[R_OFF, R2]), rules(&[R_ON, R2])]));
+        apply(&p, &f, Verb::Enable, 100).unwrap();
+        assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "group:g.rules\n");
+        assert!(fs::read_to_string(&p.enable_conf).unwrap().contains("100"));
+        assert_eq!(f.seen_enable.borrow().len(), 2);
+    }
+
+    #[test]
+    fn failed_reload_removes_a_newly_created_enable_conf() {
+        let live = rules(&[R_OFF]);
+        let (_t, p) = setup("ec-fail", &live, "group:g.rules\n");
+        let f = Fake::ok(rules(&[R_ON]));
+        *f.reloads.borrow_mut() = vec![true, false];
+        assert!(apply(&p, &f, Verb::Enable, 100).is_err());
+        assert!(!p.enable_conf.exists());
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
+        assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "group:g.rules\n");
+    }
+
+    #[test]
+    fn enable_conf_is_backed_up_when_it_exists() {
+        let (_t, p) = setup("ec-backup", &rules(&[R_ON]), "5\n");
+        fs::write(&p.enable_conf, "77\n").unwrap();
+        apply(&p, &Fake::ok(rules(&[R_OFF])), Verb::Disable, 100).unwrap();
+        let b = fs::read_dir(&p.backup_root).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(fs::read_to_string(b.join("enable.conf")).unwrap(), "77\n");
+        assert_eq!(fs::read_to_string(&p.enable_conf).unwrap(), "77\n");
     }
 }

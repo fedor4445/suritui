@@ -74,6 +74,10 @@ impl RulesBrowser {
         }
     }
 
+    pub fn entry(&self, sid: u64) -> Option<&CatalogEntry> {
+        self.entries.iter().find(|e| e.sid == sid)
+    }
+
     pub fn query(&self) -> &str {
         &self.query
     }

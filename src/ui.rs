@@ -88,10 +88,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     let hint = match app.mode {
         Mode::List => "  ? help   2 rules   3 sources",
+        Mode::Detail if app.can_change() => "  Esc back   r rule text   w raw JSON   d disable this rule",
         Mode::Detail => "  Esc back   r rule text   w raw JSON",
+        Mode::Rule if app.can_change() => "  Esc back   d disable this rule",
         Mode::Rules if app.browser.as_ref().is_some_and(|b| b.editing) => {
             "  typing a search: Enter keeps it, Esc drops it"
         }
+        Mode::Rules if app.can_change() => "  / search   s state   d disable   e enable   Enter rule   1 alerts",
         Mode::Rules => "  / search   s state   c clear   Enter rule   1 alerts   3 sources",
         Mode::Sources => "  R reload   1 alerts   2 rules   Esc back",
         Mode::Confirm => "  y confirm   Esc cancel",
@@ -529,11 +532,10 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     let Some(p) = &app.pending else {
         return scroll_screen(f, app, area, "Confirm", vec![Line::from("Nothing to confirm.")]);
     };
-    let (word, what) = match p.verb {
-        crate::admin::Verb::Disable => ("Disable", "adds"),
-        crate::admin::Verb::Enable => ("Enable", "removes"),
+    let word = match p.verb {
+        crate::admin::Verb::Disable => "Disable",
+        crate::admin::Verb::Enable => "Enable",
     };
-    let to_from = if p.verb == crate::admin::Verb::Disable { "to" } else { "from" };
     let lines = vec![
         Line::from(Span::styled(
             format!("{word} rule {}?", p.sid),
@@ -541,9 +543,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
         )),
         plain(&p.msg),
         Line::default(),
-        Line::from(format!(
-            "This {what} the sid {to_from} disable.conf, rebuilds the rules and reloads Suricata live."
-        )),
+        Line::from(format!("This {}, rebuilds the rules and reloads Suricata live.", p.how)),
         Line::from("The rebuild can take a couple of minutes. Suricata keeps watching with the old rules until the reload."),
         Line::from("A backup is made first. If the check or the reload fails, the previous rules are put back."),
         Line::default(),
@@ -651,7 +651,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("w", "raw JSON (from detail)"),
         ("R", "refresh"),
         ("2 / 3 / 1", "rules / sources / alerts"),
-        ("d / e", "rule screen: disable / enable (router)"),
+        ("d / e", "disable / enable a rule: rules list, rule screen; d on an alert (router)"),
         ("y", "confirm a change (Esc cancels)"),
         ("/ s c", "rules: search / state filter / clear"),
         ("?", "this help"),
@@ -1729,20 +1729,22 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
     }
 
     #[test]
-    fn enable_needs_the_sid_in_disable_conf() {
+    fn enable_explains_which_file_changes() {
         let mut a = change_app(fake(Ok(vec![]), AFTER_DISABLED));
         press(&mut a, KeyCode::Esc);
-        key(&mut a, 's'); // disabled only -> sid 2000002, which the fake lists
+        key(&mut a, 's'); // disabled only -> sid 2000002, listed in disable.conf by the fixture
         press(&mut a, KeyCode::Enter);
         key(&mut a, 'e');
         assert_eq!(a.mode, Mode::Confirm);
-        assert!(screen(&a, 100, 12).contains("Enable rule 2000002?"));
+        let s = screen(&a, 120, 12);
+        assert!(s.contains("Enable rule 2000002?") && s.contains("removes the sid from disable.conf"), "{s}");
         press(&mut a, KeyCode::Esc);
-        // a rule off by group/source: not in disable.conf by sid
+        // a rule a group keeps off: not in disable.conf by sid -> enable.conf
         a.browser.as_mut().unwrap().disable.sids.clear();
         key(&mut a, 'e');
-        assert_eq!(a.mode, Mode::RuleInfo);
-        assert!(a.status.contains("group or in the source"), "{}", a.status);
+        assert_eq!(a.mode, Mode::Confirm, "{}", a.status);
+        let s = screen(&a, 120, 12);
+        assert!(s.contains("adds the sid to enable.conf"), "{s}");
     }
 
     #[test]
@@ -1793,5 +1795,63 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         press(&mut a, KeyCode::Enter);
         key(&mut a, 'e');
         assert_eq!(a.mode, Mode::Confirm, "{}", a.status);
+    }
+
+    // ---- d / e from other screens ----
+
+    #[test]
+    fn d_and_e_work_from_the_rules_list() {
+        let mut a = rules_app();
+        a.browser.as_mut().unwrap().disable.sids.insert(2000002);
+        a.set_admin(fake(Ok(vec![]), AFTER_DISABLED));
+        assert!(footer(&a, 100, 12).contains("d disable   e enable"));
+        key(&mut a, 'd'); // highlighted row is sid 2000001, enabled
+        assert_eq!(a.mode, Mode::Confirm);
+        assert!(screen(&a, 120, 12).contains("Disable rule 2000001?"));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::Rules, "Esc goes back where it started");
+        key(&mut a, 'e'); // already enabled
+        assert_eq!(a.mode, Mode::Rules);
+        assert!(a.status.contains("already enabled"), "{}", a.status);
+        key(&mut a, 'j'); // sid 2000002, disabled
+        key(&mut a, 'e');
+        assert_eq!(a.mode, Mode::Confirm);
+        assert!(screen(&a, 120, 12).contains("Enable rule 2000002?"));
+    }
+
+    #[test]
+    fn d_on_an_alert_disables_its_rule_and_returns_to_the_alerts() {
+        let mut a = app_with(
+            vec![(
+                Range::Today,
+                vec![alert("2026-11-10T10:11:12.000000+0000", "ET SCAN nmap probe", "allowed", None)],
+            )],
+            Some(crate::rules::RuleIndex::from_text(RULES)),
+        );
+        a.set_admin(fake(Ok(vec!["done".into()]), AFTER_DISABLED));
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Detail);
+        assert!(footer(&a, 120, 12).contains("d disable this rule"));
+        key(&mut a, 'd');
+        assert_eq!(a.mode, Mode::Confirm);
+        assert!(screen(&a, 120, 12).contains("Disable rule 2000001?"));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::Detail);
+        key(&mut a, 'r'); // the alert's rule view
+        key(&mut a, 'd');
+        assert_eq!(a.mode, Mode::Confirm);
+        key(&mut a, 'y');
+        wait_done(&mut a);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::List, "back to the alerts");
+    }
+
+    #[test]
+    fn d_on_an_alert_without_rules_or_helper_explains() {
+        let mut a = app(vec![alert("2026-11-10T10:11:12.000000+0000", "ET SCAN x", "allowed", None)]);
+        press(&mut a, KeyCode::Enter);
+        key(&mut a, 'd');
+        assert_eq!(a.mode, Mode::Detail);
+        assert!(a.status.contains("no rules"), "{}", a.status);
     }
 }

@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::process::Command;
 
 pub const DISABLE_CONF: &str = "/usr/local/etc/suricata/disable.conf";
+pub const ENABLE_CONF: &str = "/usr/local/etc/suricata/enable.conf";
 
 /// The privileged helper; local mode never runs anything else through sudo.
 pub const HELPER: &str = "/usr/local/sbin/suritui-admin";
@@ -60,6 +61,8 @@ pub fn load_rule_index() -> Result<RuleIndex, String> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DisableConf {
     pub sids: HashSet<u64>,
+    /// Sids listed in enable.conf (they override a group or the rule source).
+    pub enabled_sids: HashSet<u64>,
     pub groups: usize,
     pub patterns: usize,
 }
@@ -87,16 +90,29 @@ pub fn parse_disable_conf(text: &str) -> DisableConf {
     d
 }
 
+/// Plain sid lines of an enable.conf.
+pub fn parse_enable_conf(text: &str) -> HashSet<u64> {
+    parse_disable_conf(text).sids
+}
+
 pub fn load_disable_conf() -> DisableConf {
-    std::fs::read_to_string(DISABLE_CONF)
+    let mut d = std::fs::read_to_string(DISABLE_CONF)
         .map(|t| parse_disable_conf(&t))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Ok(t) = std::fs::read_to_string(ENABLE_CONF) {
+        d.enabled_sids = parse_enable_conf(&t);
+    }
+    d
 }
 
 /// Why a rule is in the state it is in.
 pub fn origin(enabled: bool, sid: u64, d: &DisableConf) -> &'static str {
     if enabled {
-        "enabled"
+        if d.enabled_sids.contains(&sid) {
+            "enabled by sid in enable.conf"
+        } else {
+            "enabled"
+        }
     } else if d.sids.contains(&sid) {
         "disabled by sid in disable.conf"
     } else if d.groups > 0 || d.patterns > 0 {
@@ -176,6 +192,9 @@ mod tests {
     fn origin_wording() {
         let mut d = DisableConf::default();
         assert_eq!(origin(true, 1, &d), "enabled");
+        d.enabled_sids.insert(1);
+        assert_eq!(origin(true, 1, &d), "enabled by sid in enable.conf");
+        d.enabled_sids.clear();
         assert_eq!(origin(false, 1, &d), "disabled in the rule source");
         d.sids.insert(1);
         assert_eq!(origin(false, 1, &d), "disabled by sid in disable.conf");

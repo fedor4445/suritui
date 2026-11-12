@@ -17,6 +17,10 @@ pub struct Pending {
     pub verb: Verb,
     pub sid: u64,
     pub msg: String,
+    /// One sentence on which file is edited.
+    pub how: String,
+    /// The screen to go back to on Esc.
+    pub from: crate::model::Mode,
 }
 
 /// Does the privileged work. The real one runs the helper; tests use a fake.

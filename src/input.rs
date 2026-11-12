@@ -58,6 +58,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (Mode::Sources, KeyCode::Char('2')) => app.open_rules(),
         (Mode::Sources, KeyCode::Char('R')) => app.reload_sources(),
         (Mode::Rules, code) => rules_key(app, code),
+        (Mode::Detail | Mode::Rule, KeyCode::Char('d')) => app.request_change_for_alert(Verb::Disable),
         (Mode::RuleInfo, KeyCode::Char('d')) => app.request_change(Verb::Disable),
         (Mode::RuleInfo, KeyCode::Char('e')) => app.request_change(Verb::Enable),
         (Mode::Confirm, KeyCode::Char('y')) => app.confirm_change(),
@@ -91,6 +92,12 @@ fn rules_key(app: &mut App, code: KeyCode) {
     if code == KeyCode::Esc {
         app.set_mode(Mode::List);
         return;
+    }
+    if code == KeyCode::Char('d') {
+        return app.request_change(Verb::Disable);
+    }
+    if code == KeyCode::Char('e') {
+        return app.request_change(Verb::Enable);
     }
     let Some(b) = app.browser.as_mut() else { return };
     match code {

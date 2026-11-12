@@ -94,6 +94,7 @@ pub struct App {
     pub pending: Option<Pending>,
     pub job: Option<Job>,
     pub outcome: Option<(bool, Vec<String>)>,
+    after_done: Mode,
     cache: HashMap<Range, Loaded>,
     pub mode: Mode,
     pub range: Range,
@@ -132,6 +133,7 @@ impl App {
             pending: None,
             job: None,
             outcome: None,
+            after_done: Mode::Rules,
             cache: HashMap::new(),
             mode: Mode::List,
             range: Range::Today,
@@ -301,8 +303,39 @@ impl App {
         self.admin.as_ref().is_some_and(|a| a.available())
     }
 
-    /// `d` / `e` on the rule screen: ask first, change nothing yet.
+    /// Build the rules catalog on first use. False when no rules are loaded.
+    fn ensure_browser(&mut self) -> bool {
+        if self.browser.is_none() {
+            let Some(idx) = &self.rules else { return false };
+            let disable = if self.cfg.local { local::load_disable_conf() } else { DisableConf::default() };
+            self.browser = Some(RulesBrowser::new(local::catalog(idx), disable));
+        }
+        true
+    }
+
+    /// `d` / `e` on the Rules list or the rule screen: the highlighted rule.
     pub fn request_change(&mut self, want: Verb) {
+        let sid = self.browser.as_ref().and_then(|b| b.selected()).map(|e| e.sid);
+        if let Some(sid) = sid {
+            self.request_change_sid(sid, want);
+        }
+    }
+
+    /// `d` on an alert screen: the rule behind the alert.
+    pub fn request_change_for_alert(&mut self, want: Verb) {
+        let Some(sid) = self.selected().and_then(|a| a.sid) else {
+            self.status = "this alert has no rule id".to_string();
+            return;
+        };
+        if !self.ensure_browser() {
+            self.status = "no rules are loaded here".to_string();
+            return;
+        }
+        self.request_change_sid(sid, want);
+    }
+
+    /// Ask first, change nothing yet.
+    fn request_change_sid(&mut self, sid: u64, want: Verb) {
         let Some(admin) = &self.admin else {
             self.status = "changing rules works only on the router (--local)".to_string();
             return;
@@ -312,28 +345,42 @@ impl App {
             return;
         }
         let Some(b) = &self.browser else { return };
-        let Some(e) = b.selected() else { return };
+        let Some(e) = b.entry(sid) else {
+            self.status = format!("sid {sid} is not in the loaded rules");
+            return;
+        };
         let verb = if e.enabled { Verb::Disable } else { Verb::Enable };
         if verb != want {
             self.status = format!("this rule is already {}d", want.word());
             return;
         }
-        if verb == Verb::Enable && !b.disable.sids.contains(&e.sid) {
-            self.status = "this rule is off by a group or in the source; enabling it is not supported yet".to_string();
-            return;
-        }
+        let (in_d, in_e) = (b.disable.sids.contains(&sid), b.disable.enabled_sids.contains(&sid));
+        let how = match (verb, in_d, in_e) {
+            (Verb::Disable, _, false) => "adds the sid to disable.conf".to_string(),
+            (Verb::Disable, _, true) => {
+                "removes the sid from enable.conf (and lists it in disable.conf if it is still on)".to_string()
+            }
+            (Verb::Enable, true, _) => {
+                "removes the sid from disable.conf (and lists it in enable.conf if a group keeps it off)".to_string()
+            }
+            (Verb::Enable, false, _) => {
+                "adds the sid to enable.conf, which overrides the group or source that switches it off".to_string()
+            }
+        };
         self.status.clear();
         self.pending = Some(Pending {
             verb,
-            sid: e.sid,
+            sid,
             msg: e.msg.clone(),
+            how,
+            from: self.mode,
         });
         self.set_mode(Mode::Confirm);
     }
 
     pub fn cancel_change(&mut self) {
-        self.pending = None;
-        self.set_mode(Mode::RuleInfo);
+        let back = self.pending.take().map_or(Mode::RuleInfo, |p| p.from);
+        self.set_mode(back);
     }
 
     /// The confirming second keystroke: start the helper in the background.
@@ -343,6 +390,8 @@ impl App {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let (verb, sid) = (p.verb, p.sid);
+        // Back to where the change started: the alert list for an alert's rule.
+        self.after_done = if matches!(p.from, Mode::Detail | Mode::Rule) { Mode::List } else { Mode::Rules };
         std::thread::spawn(move || {
             let out = match admin.change(verb, sid) {
                 Ok(lines) => match admin.reload() {
@@ -394,7 +443,7 @@ impl App {
 
     pub fn dismiss_outcome(&mut self) {
         self.outcome = None;
-        self.set_mode(Mode::Rules);
+        self.set_mode(self.after_done);
     }
 
     pub fn is_local(&self) -> bool {
