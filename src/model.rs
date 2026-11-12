@@ -562,7 +562,7 @@ impl App {
         self.pending = Some(Pending {
             action: Action::Suppress { add: false, sid, track, ip: ip.clone() },
             msg: e.line.clone(),
-            how: "removes this suppress entry from threshold.config, so the rule alerts for this host again"
+            how: "removes the suppress entry from threshold.config, so the rule alerts for this host again"
                 .to_string(),
             from: self.mode,
         });
