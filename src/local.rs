@@ -82,9 +82,10 @@ pub fn parse_disable_conf(text: &str) -> DisableConf {
         } else if line.starts_with("re:") {
             d.patterns += 1;
         } else {
-            // "2012345" or "1:2012345" (gid:sid)
-            let sid = line.rsplit(':').next().unwrap_or("");
-            if let Ok(n) = sid.trim().parse::<u64>() {
+            // "2012345", "1:2012345" (gid:sid), optionally followed by a comment
+            let first = line.split_whitespace().next().unwrap_or("");
+            let sid = first.rsplit(':').next().unwrap_or("");
+            if let Ok(n) = sid.parse::<u64>() {
                 d.sids.insert(n);
             }
         }
@@ -186,6 +187,14 @@ mod tests {
         assert_eq!(d.groups, 1);
         assert_eq!(d.patterns, 1);
         assert!(d.sids.contains(&2012345) && d.sids.contains(&2099999));
+        assert_eq!(d.sids.len(), 2);
+    }
+
+    #[test]
+    fn disable_conf_lines_with_trailing_comments_count() {
+        // the exact form suritui-admin writes
+        let d = parse_disable_conf("2002979  # suritui 2026-11-12\n1:2000001   # old\n");
+        assert!(d.sids.contains(&2002979) && d.sids.contains(&2000001));
         assert_eq!(d.sids.len(), 2);
     }
 

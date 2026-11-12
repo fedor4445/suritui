@@ -517,9 +517,11 @@ fn draw_rule_info(f: &mut Frame, app: &App, area: Rect) {
         plain(&rule.text),
     ];
     lines.push(Line::default());
-    lines.push(Line::from(
-        "This is the rule as Suricata loaded it. Changing rules is not built yet.",
-    ));
+    lines.push(Line::from(if app.can_change() {
+        "This is the rule as Suricata loaded it."
+    } else {
+        "This is the rule as Suricata loaded it. Rules can be changed only on the router (suritui --local)."
+    }));
     scroll_screen(f, app, area, "Rule", lines);
 }
 
@@ -1770,5 +1772,26 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         a.mode = Mode::Help;
         let s = screen(&a, 100, 40);
         assert!(s.contains("disable / enable") && s.contains("confirm a change"), "{s}");
+    }
+
+    #[test]
+    fn change_screens_do_not_show_alert_counts() {
+        let mut a = change_app(fake(Ok(vec![]), AFTER_DISABLED));
+        key(&mut a, 'd');
+        let f = footer(&a, 100, 14);
+        assert!(f.contains("3 rules") && !f.contains("alerts in this range"), "{f}");
+        assert!(!screen(&change_app(fake(Ok(vec![]), AFTER_DISABLED)), 100, 12).contains("not built yet"));
+    }
+
+    #[test]
+    fn enable_works_for_the_exact_line_the_helper_writes() {
+        // browser disable.conf as parsed from the helper's own line
+        let mut a = rules_app();
+        a.browser.as_mut().unwrap().disable = crate::local::parse_disable_conf("2000002  # suritui 2026-11-12\n");
+        a.set_admin(fake(Ok(vec![]), AFTER_DISABLED));
+        key(&mut a, 's');
+        press(&mut a, KeyCode::Enter);
+        key(&mut a, 'e');
+        assert_eq!(a.mode, Mode::Confirm, "{}", a.status);
     }
 }

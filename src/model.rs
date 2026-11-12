@@ -593,7 +593,9 @@ impl App {
     }
 
     pub fn status_line(&self) -> String {
-        if let (Mode::Rules | Mode::RuleInfo, Some(b)) = (self.mode, &self.browser) {
+        if let (Mode::Rules | Mode::RuleInfo | Mode::Confirm | Mode::Working | Mode::Done, Some(b)) =
+            (self.mode, &self.browser)
+        {
             let mut s = format!(
                 "{} rules, {} disabled",
                 group(b.total()),
