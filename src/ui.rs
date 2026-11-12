@@ -101,7 +101,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         Mode::Rules if app.can_change() => "  / search   s state   d disable   e enable   Enter rule   1 alerts",
         Mode::Rules => "  / search   s state   c clear   Enter rule   1 alerts   3 sources",
-        Mode::Sources => "  j k move   e switch on   d switch off   R reload   1 alerts   2 rules   Esc back",
+        Mode::Sources => "  j k move   e switch on   d switch off   R refresh list   1 alerts   2 rules   Esc back",
         Mode::Updates if app.can_change() => "  U update now   R reload   1 alerts   2 rules   3 sources",
         Mode::Updates => "  R reload   1 alerts   2 rules   3 sources",
         Mode::Thresholds => "  x remove   R reload   1 alerts   2 rules   4 updates",
@@ -720,7 +720,7 @@ fn draw_sources(f: &mut Frame, app: &App, area: Rect) {
         rows.push((Line::from(Span::styled(fit(&source_text(s), w), Style::default().add_modifier(Modifier::DIM))), false));
     }
     rows.push((Line::default(), false));
-    rows.push((Line::from("Keys are not supported yet."), false));
+    rows.push((Line::from("Keys are not supported yet. R fetches the current source list from the internet."), false));
     let at = rows.iter().position(|(_, s)| *s).unwrap_or(0);
     let top = if h == 0 || at < h { 0 } else { at + 1 - h };
     let mut lines = vec![Line::from(Span::styled(fit("Rule sources", w), header_style()))];
@@ -748,7 +748,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("5, x", "suppress list; x removes the highlighted entry"),
         ("6 / 7", "settings (read-only) / logs (Tab: next log)"),
         ("d / e", "disable / enable a rule: rules list, rule screen; d on an alert (router)"),
-        ("3, j k, e / d", "sources: move, switch the highlighted free source on / off"),
+        ("3, j k, e / d", "sources: move, switch the highlighted free source on / off; R refreshes the list"),
         ("y", "confirm a change (Esc cancels)"),
         ("/ s c", "rules: search / state filter / clear"),
         ("?", "this help"),
@@ -1965,7 +1965,7 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         fn change(&self, _v: Verb, _sid: u64) -> Result<Vec<String>, String> {
             Ok(vec![])
         }
-        fn sources(&self) -> Result<Vec<String>, String> {
+        fn sources(&self, _refresh: bool) -> Result<Vec<String>, String> {
             Ok("Name: et/open\n  Summary: ET Open\n  License: MIT\n=====index=====\nName: et/open\n  Summary: ET Open\n  License: MIT\nName: abuse.ch/urlhaus\n  Summary: URLhaus rules\n  License: CC0-1.0\nName: et/pro\n  License: Commercial\n  Parameters: secret-code\n"
                 .lines()
                 .map(str::to_string)

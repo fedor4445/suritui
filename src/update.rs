@@ -169,7 +169,21 @@ pub fn info(paths: &Paths, runner: &dyn Runner) -> Report {
     r
 }
 
-fn run_update_build(paths: &Paths, runner: &dyn Runner) -> Result<String, String> {
+/// Downloads that `suricata-update` could not make. It only logs these and
+/// carries on with the sources that worked, so they must be looked for.
+fn failed_fetches(o: &Out) -> Vec<String> {
+    let mut v: Vec<String> = o
+        .stdout
+        .lines()
+        .chain(o.stderr.lines())
+        .filter(|l| l.contains("Failed to fetch"))
+        .map(|l| l.rsplit(" -- ").next().unwrap_or(l).trim().to_string())
+        .collect();
+    v.dedup();
+    v
+}
+
+fn run_update_build(paths: &Paths, runner: &dyn Runner) -> Result<(String, Vec<String>), String> {
     let _ = fs::remove_dir_all(&paths.build_dir);
     fs::create_dir_all(&paths.build_dir).map_err(|e| io("cannot create the build directory", e))?;
     let dir = paths.build_dir.to_string_lossy().into_owned();
@@ -181,7 +195,9 @@ fn run_update_build(paths: &Paths, runner: &dyn Runner) -> Result<String, String
         let tail: Vec<&str> = o.stdout.lines().chain(o.stderr.lines()).rev().take(3).collect();
         return Err(format!("the update failed (exit {:?}): {}", o.code, tail.join(" | ")));
     }
-    fs::read_to_string(paths.build_dir.join("suricata.rules")).map_err(|e| io("the update produced no rules file", e))
+    let failed = failed_fetches(&o);
+    let text = fs::read_to_string(paths.build_dir.join("suricata.rules")).map_err(|e| io("the update produced no rules file", e))?;
+    Ok((text, failed))
 }
 
 /// Root check, the helper lock, and "no other update is running". The lock is
@@ -205,11 +221,13 @@ pub(crate) fn begin(paths: &Paths, runner: &dyn Runner) -> Result<Lock, String> 
 /// Download and install the newest rules, like the daily job, but checked.
 pub fn apply_update(paths: &Paths, runner: &dyn Runner) -> Result<Report, String> {
     let _lock = begin(paths, runner)?;
-    update_locked(paths, runner)
+    update_locked(paths, runner, false)
 }
 
 /// The update itself; the caller holds the lock (see `begin`).
-pub(crate) fn update_locked(paths: &Paths, runner: &dyn Runner) -> Result<Report, String> {
+/// With `strict`, a failed download of any source is an error (a source was
+/// just switched on and must work); otherwise it is reported as a warning.
+pub(crate) fn update_locked(paths: &Paths, runner: &dyn Runner, strict: bool) -> Result<Report, String> {
     let mut rep = Report::default();
     let rules_meta = plain_file(&paths.rules)?;
     let live_rules = fs::read_to_string(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
@@ -222,13 +240,20 @@ pub(crate) fn update_locked(paths: &Paths, runner: &dyn Runner) -> Result<Report
     let cleanup = || {
         let _ = fs::remove_dir_all(&paths.build_dir);
     };
-    let cand_rules = match run_update_build(paths, runner) {
+    let (cand_rules, failed) = match run_update_build(paths, runner) {
         Ok(t) => t,
         Err(e) => {
             cleanup();
             return Err(e);
         }
     };
+    if strict && !failed.is_empty() {
+        cleanup();
+        return Err(format!("a download failed ({}); nothing was installed", failed.join("; ")));
+    }
+    for f in &failed {
+        say(&mut rep, format!("warning: {f}"));
+    }
     let cand_class = fs::read_to_string(paths.build_dir.join("classification.config")).ok();
     cleanup();
 

@@ -303,14 +303,22 @@ impl App {
             return;
         }
         if self.sources.is_none() {
-            self.reload_sources();
+            self.load_sources(false);
         }
         self.status.clear();
         self.set_mode(Mode::Sources);
     }
 
+    /// `R` on the Sources screen: fetch the current source index from the internet.
     pub fn reload_sources(&mut self) {
-        let view = match self.admin.as_ref().map(|a| a.sources()) {
+        self.load_sources(true);
+        if self.sources.as_ref().is_some_and(|v| v.error.is_none()) {
+            self.status = "source list refreshed from the internet".to_string();
+        }
+    }
+
+    pub fn load_sources(&mut self, refresh: bool) {
+        let view = match self.admin.as_ref().map(|a| a.sources(refresh)) {
             Some(Ok(lines)) => browser::sources_from_lines(&lines),
             Some(Err(e)) => SourcesView { error: Some(e), ..Default::default() },
             None => SourcesView {
@@ -546,7 +554,7 @@ impl App {
             self.load_updates();
         }
         if self.after_done == Mode::Sources {
-            self.reload_sources();
+            self.load_sources(false);
         }
         if self.after_done == Mode::Thresholds {
             self.load_thresholds();

@@ -7,7 +7,7 @@
 //!   suritui-admin rules
 //!   suritui-admin log suricata | update | admin
 //!   suritui-admin alerts live | day K
-//!   suritui-admin sources
+//!   suritui-admin sources [refresh]
 //!   suritui-admin source enable|disable NAME
 //!   suritui-admin disable SID
 //!   suritui-admin enable SID
@@ -21,7 +21,7 @@ use suritui::update::{apply_update, info};
 use suritui::source::Range;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: suritui-admin status | info | log suricata|update|admin | update | suppress|unsuppress SID by_src|by_dst IP | rules | sources | source enable|disable NAME | alerts live | alerts day K | disable SID | enable SID");
+    eprintln!("usage: suritui-admin status | info | log suricata|update|admin | update | suppress|unsuppress SID by_src|by_dst IP | rules | sources [refresh] | source enable|disable NAME | alerts live | alerts day K | disable SID | enable SID");
     ExitCode::from(2)
 }
 
@@ -63,7 +63,8 @@ fn main() -> ExitCode {
         ["status"] => Ok(status(&paths, &runner)),
         ["info"] => Ok(info(&paths, &runner)),
         ["update"] => apply_update(&paths, &runner),
-        ["sources"] => suritui::sources::list(&paths, &runner),
+        ["sources"] => suritui::sources::list(&paths, &runner, false),
+        ["sources", "refresh"] => suritui::sources::list(&paths, &runner, true),
         ["source", verb @ ("enable" | "disable"), name] => {
             suritui::sources::change(&paths, &runner, *verb == "enable", name)
         }

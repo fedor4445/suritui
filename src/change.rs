@@ -45,7 +45,7 @@ pub trait Admin: Send + Sync {
         Err("updating is not available here".to_string())
     }
     /// The source lists (see `sources::list`).
-    fn sources(&self) -> Result<Vec<String>, String> {
+    fn sources(&self, _refresh: bool) -> Result<Vec<String>, String> {
         Err("rule sources are not available here".to_string())
     }
     /// Switch a source on or off.
@@ -125,8 +125,12 @@ impl Admin for LocalAdmin {
         run_helper(&["info"])
     }
 
-    fn sources(&self) -> Result<Vec<String>, String> {
-        run_helper(&["sources"])
+    fn sources(&self, refresh: bool) -> Result<Vec<String>, String> {
+        if refresh {
+            run_helper(&["sources", "refresh"])
+        } else {
+            run_helper(&["sources"])
+        }
     }
 
     fn source(&self, enable: bool, name: &str) -> Result<Vec<String>, String> {

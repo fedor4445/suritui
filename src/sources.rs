@@ -39,7 +39,12 @@ fn must(paths: &Paths, runner: &dyn Runner, args: &[&str]) -> Result<Out, String
 
 /// What the Sources screen shows: the enabled sources, a marker line, then
 /// the whole index. Both texts are `suricata-update`'s own output.
-pub fn list(paths: &Paths, runner: &dyn Runner) -> Result<Report, String> {
+pub fn list(paths: &Paths, runner: &dyn Runner, refresh: bool) -> Result<Report, String> {
+    if refresh {
+        // The index that ships with suricata-update goes stale (some sources
+        // disappear); this fetches the current one.
+        must(paths, runner, &["update-sources"])?;
+    }
     let en = must(paths, runner, &["list-enabled-sources"])?;
     let all = must(paths, runner, &["list-sources"])?;
     let mut rep = Report::default();
@@ -100,8 +105,11 @@ pub fn change(paths: &Paths, runner: &dyn Runner, enable: bool, name: &str) -> R
         must(paths, runner, &["disable-source", name])?;
         undo.push(("enable-source", name.to_string()));
     }
-    match update_locked(paths, runner) {
+    match update_locked(paths, runner, true) {
         Ok(r) => {
+            if enable && r.lines.iter().any(|l| l.contains("already up to date")) {
+                say(&mut rep, format!("note: {name} added no rules"));
+            }
             rep.lines.extend(r.lines);
             log_line(paths, runner, &format!("source {} {name}", if enable { "enabled" } else { "disabled" }));
             Ok(rep)
@@ -139,6 +147,7 @@ mod tests {
         enabled: RefCell<Vec<String>>,
         build: String,
         reloaded: Cell<u32>,
+        fetch_error: Cell<bool>,
     }
 
     fn out(code: i32, stdout: &str) -> Result<Out, String> {
@@ -155,6 +164,7 @@ mod tests {
                 ("/bin/ps", _) => out(1, ""),
                 ("/usr/bin/logger", _) => out(0, ""),
                 ("su", ["list-sources"]) => out(0, INDEX),
+                ("su", ["update-sources"]) => out(0, ""),
                 ("su", ["list-enabled-sources"]) => {
                     let e: String = self.enabled.borrow().iter().map(|n| format!("Name: {n}\n")).collect();
                     out(0, &e)
@@ -170,6 +180,9 @@ mod tests {
                 ("/usr/bin/timeout", _) => {
                     let dir = args[args.iter().position(|a| *a == "-o").unwrap() + 1];
                     fs::write(Path::new(dir).join("suricata.rules"), &self.build).unwrap();
+                    if self.fetch_error.get() {
+                        return out(0, "12/11/2026 -- 05:52:07 - <Error> -- Failed to fetch https://x.example/r.tar.gz: HTTP Error 410: Gone\n");
+                    }
                     out(0, "")
                 }
                 ("sc", ["-c", "ruleset-reload-time"]) | ("sc", [_, "ruleset-reload-time"]) => out(
@@ -225,6 +238,7 @@ mod tests {
             enabled: RefCell::new(enabled.iter().map(|s| s.to_string()).collect()),
             build: build.to_string(),
             reloaded: Cell::new(0),
+            fetch_error: Cell::new(false),
         };
         (Tmp(d), p, f)
     }
@@ -241,10 +255,19 @@ mod tests {
     #[test]
     fn list_has_both_parts() {
         let (_t, p, f) = setup("list", &["et/open"], "");
-        let l = list(&p, &f).unwrap().lines;
+        let l = list(&p, &f, false).unwrap().lines;
         let at = l.iter().position(|x| x == SEPARATOR).unwrap();
         assert_eq!(parse_sources(&l[..at].join("\n")).len(), 1);
         assert_eq!(parse_sources(&l[at + 1..].join("\n")).len(), 3);
+    }
+
+    #[test]
+    fn refresh_fetches_the_index_first() {
+        let (_t, p, f) = setup("refresh", &["et/open"], "");
+        list(&p, &f, true).unwrap();
+        let c = f.calls.borrow();
+        let u = c.iter().position(|x| x == "su update-sources").unwrap();
+        assert!(c[u + 1].contains("list-enabled-sources"));
     }
 
     #[test]
@@ -254,6 +277,17 @@ mod tests {
         assert_eq!(*f.enabled.borrow(), vec!["et/open", "abuse.ch/urlhaus"]);
         assert!(r.contains("et/open is now listed explicitly") && r.contains("1 added"), "{r}");
         assert!(fs::read_to_string(&p.rules).unwrap().contains("sid:300"));
+    }
+
+    #[test]
+    fn a_source_that_cannot_be_downloaded_is_refused() {
+        let (_t, p, f) = setup("fetch", &["et/open"], &format!("{A}\n{B}\n{C}\n"));
+        f.fetch_error.set(true);
+        let e = change(&p, &f, true, "abuse.ch/urlhaus").unwrap_err();
+        assert!(e.contains("Failed to fetch https://x.example/r.tar.gz: HTTP Error 410: Gone"), "{e}");
+        assert!(e.contains("nothing was installed") && e.contains("undone"), "{e}");
+        assert_eq!(*f.enabled.borrow(), vec!["et/open"]);
+        assert!(!fs::read_to_string(&p.rules).unwrap().contains("sid:300"));
     }
 
     #[test]
