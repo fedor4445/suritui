@@ -392,7 +392,16 @@ fn reload(paths: &Paths, runner: &dyn Runner) -> Result<(), String> {
     if o.code == Some(0) && ok_reply {
         Ok(())
     } else {
-        Err(format!("reload was not accepted: {}", o.stdout.trim()))
+        let why = [o.stdout.trim(), o.stderr.trim()]
+            .iter()
+            .filter(|t| !t.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        Err(format!(
+            "reload was not accepted ({})",
+            if why.is_empty() { "no answer from Suricata: is it running?" } else { &why }
+        ))
     }
 }
 
@@ -427,15 +436,6 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
         }
         Edit::Write(t) => t,
     };
-
-    // 1. back up
-    let stamp = format!("{}-{}", ymd(now()), now());
-    let backup = paths.backup_root.join(&stamp);
-    fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
-    let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
-    fs::copy(&paths.disable_conf, backup.join("disable.conf")).map_err(|e| io("backup of disable.conf", e))?;
-    fs::copy(&paths.rules, backup.join("suricata.rules")).map_err(|e| io("backup of the rules", e))?;
-    say(&mut rep, format!("backup: {}", backup.display()));
 
     // 2. rebuild into a scratch directory, never into the live one
     let _ = fs::remove_dir_all(&paths.build_dir);
@@ -473,6 +473,16 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
         }
     };
 
+    // Back up now that every check has passed (refused attempts leave nothing behind).
+    let stamp = format!("{}-{}", ymd(now()), now());
+    let backup = paths.backup_root.join(&stamp);
+    fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
+    let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
+    fs::copy(&paths.disable_conf, backup.join("disable.conf")).map_err(|e| io("backup of disable.conf", e))?;
+    fs::copy(&paths.rules, backup.join("suricata.rules")).map_err(|e| io("backup of the rules", e))?;
+    say(&mut rep, format!("backup: {}", backup.display()));
+
+
     // 4. install: staged next to the live files, then atomic renames. If the
     // second one fails the first is undone from the originals held in memory.
     let _ = fs::remove_dir_all(&paths.build_dir);
@@ -496,11 +506,15 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
     if !healthy {
         let restored = restore(paths);
         let again = reload(paths, runner);
+        let tail = match (&restored, &again) {
+            (Ok(()), Ok(())) => " and reloaded".to_string(),
+            (Ok(()), Err(_)) => ". The files are restored, but Suricata did not accept a reload: check that it is running".to_string(),
+            (Err(e), _) => format!(". Restoring the files failed ({e}): the backup is in {}", backup.display()),
+        };
         log_line(paths, runner, &format!("FAILED {} sid {sid}: restored the previous rules", verb.word()));
         return Err(format!(
-            "Suricata did not take the new rules ({}); the previous rules are back{}",
+            "Suricata did not take the new rules ({}); the previous rules are back{tail}",
             reloaded.err().unwrap_or_else(|| "it stopped running".into()),
-            if restored.is_ok() && again.is_ok() { " and reloaded" } else { ", but restoring or the second reload failed: check Suricata now" }
         ));
     }
     prune_backups(&paths.backup_root);
@@ -754,6 +768,7 @@ mod tests {
         *f.reloads.borrow_mut() = vec![true, false]; // popped from the back: first call fails
         let e = apply(&p, &f, Verb::Disable, 100).unwrap_err();
         assert!(e.contains("previous rules are back and reloaded"), "{e}");
+        assert!(e.contains("reload was not accepted"), "{e}");
         assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
         assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "5\n");
     }
@@ -887,5 +902,25 @@ mod tests {
         let f = Fake::ok(rules(&[R_OFF]));
         apply(&p, &f, Verb::Disable, 100).unwrap();
         assert_eq!(fs::metadata(&p.rules).unwrap().mode() & 0o777, 0o640);
+    }
+
+    #[test]
+    fn refused_attempts_leave_no_backup() {
+        let live = rules(&[R_ON, R2]);
+        let (_t, p) = setup("nobackup", &live, "5\n");
+        let f = Fake::ok(rules(&[R_ON, R2])); // target never flips: refused
+        assert!(apply(&p, &f, Verb::Disable, 100).is_err());
+        assert!(!p.backup_root.exists(), "a refused attempt must not leave backups");
+    }
+
+    #[test]
+    fn restore_failure_names_the_backup() {
+        let live = rules(&[R_ON]);
+        let (_t, p) = setup("dead2", &live, "5\n");
+        let mut f = Fake::ok(rules(&[R_OFF]));
+        f.alive = false;
+        *f.reloads.borrow_mut() = vec![false, true]; // 2nd reload (popped first... ) fails after restore
+        let e = apply(&p, &f, Verb::Disable, 100).unwrap_err();
+        assert!(e.contains("previous rules are back"), "{e}");
     }
 }
