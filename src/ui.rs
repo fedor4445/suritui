@@ -599,7 +599,7 @@ fn draw_done(f: &mut Frame, app: &App, area: Rect) {
     }];
     lines.extend(text.iter().map(|l| plain(l)));
     lines.push(Line::default());
-    lines.push(Line::from("Press Enter to go back to the rules."));
+    lines.push(Line::from("Press Enter to continue."));
     scroll_screen(f, app, area, if ok { "Change finished" } else { "Change failed" }, lines);
 }
 

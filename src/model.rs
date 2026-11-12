@@ -706,6 +706,9 @@ impl App {
         if self.mode == Mode::Sources {
             return "rule sources".to_string();
         }
+        if matches!(self.mode, Mode::Confirm | Mode::Working | Mode::Done) {
+            return self.status.clone();
+        }
         if self.mode == Mode::Updates {
             return "updates and status".to_string();
         }
