@@ -125,7 +125,8 @@ pub fn summarize(path: &str, text: &str) -> Vec<String> {
     if !outs.is_empty() {
         let list: Vec<String> = outs
             .iter()
-            .map(|(n, e)| format!("{n} ({})", if e.is_empty() { "?" } else if yes(e) { "on" } else { "off" }))
+            .filter(|(_, e)| !e.is_empty())
+            .map(|(n, e)| format!("{n} ({})", if yes(e) { "on" } else { "off" }))
             .collect();
         r.push(format!("  outputs          {}", list.join(", ")));
     }
