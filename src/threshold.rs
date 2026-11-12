@@ -309,6 +309,7 @@ mod tests {
         reloads: RefCell<Vec<bool>>,
         alive: bool,
         seen_candidate: RefCell<Vec<String>>,
+        reloaded: std::cell::Cell<u32>,
     }
 
     fn out(code: i32, stdout: &str) -> Result<Out, String> {
@@ -329,10 +330,17 @@ mod tests {
                     self.seen_candidate.borrow_mut().push(fs::read_to_string(path).unwrap());
                     if self.t_ok { out(0, "ok") } else { out(1, "E: threshold-config: parse error, string , track by_src, ip x") }
                 }
-                "sc" => {
-                    let ok = self.reloads.borrow_mut().pop().unwrap_or(true);
-                    out(if ok { 0 } else { 1 }, if ok { "{\"return\":\"OK\"}" } else { "{\"return\":\"NOK\"}" })
-                }
+                "sc" => match args[1] {
+                    "ruleset-reload-time" => out(0, &format!("{{\"message\":[{{\"id\":0,\"last_reload\":\"T{}\"}}],\"return\":\"OK\"}}", self.reloaded.get())),
+                    "ruleset-stats" => out(0, "{\"message\":[{\"id\":0,\"rules_loaded\":1,\"rules_failed\":0,\"rules_skipped\":0}],\"return\":\"OK\"}"),
+                    _ => {
+                        let ok = self.reloads.borrow_mut().pop().unwrap_or(true);
+                        if ok {
+                            self.reloaded.set(self.reloaded.get() + 1);
+                        }
+                        out(if ok { 0 } else { 1 }, if ok { "{\"return\":\"OK\"}" } else { "{\"return\":\"NOK\"}" })
+                    }
+                },
                 "/usr/bin/logger" => out(0, ""),
                 other => panic!("unexpected program {other}"),
             }
@@ -340,7 +348,7 @@ mod tests {
     }
 
     fn fake() -> Fake {
-        Fake { calls: RefCell::new(vec![]), t_ok: true, reloads: RefCell::new(vec![true]), alive: true, seen_candidate: RefCell::new(vec![]) }
+        Fake { calls: RefCell::new(vec![]), t_ok: true, reloads: RefCell::new(vec![true]), alive: true, seen_candidate: RefCell::new(vec![]), reloaded: std::cell::Cell::new(0) }
     }
 
     struct Tmp(PathBuf);
@@ -372,6 +380,7 @@ mod tests {
             suricata_update: "su".into(),
             suricatasc: "sc".into(),
             require_root: false,
+            reload_wait_secs: 0,
         };
         fs::write(&p.rules, A.to_string() + "\n").unwrap();
         fs::write(&p.disable_conf, "5\n").unwrap();

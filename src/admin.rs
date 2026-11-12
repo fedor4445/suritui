@@ -289,6 +289,8 @@ pub struct Paths {
     pub suricata_update: String,
     pub suricatasc: String,
     pub require_root: bool,
+    /// How long to wait for a started reload to finish.
+    pub reload_wait_secs: u64,
 }
 
 impl Paths {
@@ -313,6 +315,7 @@ impl Paths {
             suricata_update: "/usr/local/bin/suricata-update".into(),
             suricatasc: "/usr/local/bin/suricatasc".into(),
             require_root: true,
+            reload_wait_secs: 180,
         }
     }
 }
@@ -455,23 +458,61 @@ pub(crate) fn suricata_running(runner: &dyn Runner) -> bool {
         .unwrap_or(false)
 }
 
+/// `last_reload` of the running ruleset: it changes when a reload has finished.
+fn last_reload(paths: &Paths, runner: &dyn Runner) -> Option<String> {
+    let o = runner.run(&paths.suricatasc, &["-c", "ruleset-reload-time"]).ok()?;
+    let v: serde_json::Value = serde_json::from_str(o.stdout.trim()).ok()?;
+    v.get("message")?.get(0)?.get("last_reload")?.as_str().map(str::to_string)
+}
+
+fn failed_rules(paths: &Paths, runner: &dyn Runner) -> Option<u64> {
+    let o = runner.run(&paths.suricatasc, &["-c", "ruleset-stats"]).ok()?;
+    let v: serde_json::Value = serde_json::from_str(o.stdout.trim()).ok()?;
+    v.get("message")?.get(0)?.get("rules_failed")?.as_u64()
+}
+
+/// Ask Suricata for a live reload and wait until it has really finished (the
+/// request itself is answered at once). Fails if Suricata does not accept it,
+/// does not finish in time, or cannot load some of the rules.
 pub(crate) fn reload(paths: &Paths, runner: &dyn Runner) -> Result<(), String> {
+    let before = last_reload(paths, runner);
+    let failed_before = failed_rules(paths, runner);
     let o = runner.run(&paths.suricatasc, &["-c", "ruleset-reload-nonblocking"])?;
     let ok_reply = o.stdout.contains("\"return\": \"OK\"") || o.stdout.contains("\"return\":\"OK\"");
-    if o.code == Some(0) && ok_reply {
-        Ok(())
-    } else {
+    if !(o.code == Some(0) && ok_reply) {
         let why = [o.stdout.trim(), o.stderr.trim()]
             .iter()
             .filter(|t| !t.is_empty())
             .copied()
             .collect::<Vec<_>>()
             .join(" ");
-        Err(format!(
+        return Err(format!(
             "reload was not accepted ({})",
             if why.is_empty() { "no answer from Suricata: is it running?" } else { &why }
-        ))
+        ));
     }
+    // Without a timestamp to compare there is nothing to wait for; the caller's
+    // health check still runs.
+    let Some(before) = before else { return Ok(()) };
+    let start = std::time::Instant::now();
+    loop {
+        if last_reload(paths, runner).is_some_and(|now| now != before) {
+            break;
+        }
+        if start.elapsed() >= std::time::Duration::from_secs(paths.reload_wait_secs) {
+            return Err(format!(
+                "Suricata accepted the reload but did not finish it within {} seconds",
+                paths.reload_wait_secs
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if let (Some(fb), Some(fa)) = (failed_before, failed_rules(paths, runner)) {
+        if fa > fb {
+            return Err(format!("Suricata could not load {} rules of the new set", fa - fb));
+        }
+    }
+    Ok(())
 }
 
 /// One file to replace: what it should hold afterwards and what it held before
@@ -959,6 +1000,14 @@ mod tests {
         reloads: RefCell<Vec<bool>>,
         /// enable.conf texts the rebuilds were given.
         seen_enable: RefCell<Vec<String>>,
+        /// Reloads Suricata has accepted (drives `ruleset-reload-time`).
+        reloaded: std::cell::Cell<u32>,
+        /// The reload never finishes.
+        stuck: bool,
+        /// `rules_failed` after a reload.
+        failed_after: u64,
+        /// Polls that still show the old timestamp after a reload was accepted.
+        slow_polls: std::cell::Cell<u32>,
     }
 
     impl Fake {
@@ -971,6 +1020,10 @@ mod tests {
                 rebuild: Rebuild::Rules(cand_rules),
                 reloads: RefCell::new(vec![true]),
                 seen_enable: RefCell::new(vec![]),
+                reloaded: std::cell::Cell::new(0),
+                stuck: false,
+                failed_after: 0,
+                slow_polls: std::cell::Cell::new(0),
             }
         }
     }
@@ -1005,10 +1058,36 @@ mod tests {
                         Rebuild::Fail => out(1, "boom"),
                     }
                 }
-                "sc" => {
-                    let ok = self.reloads.borrow_mut().pop().unwrap_or(true);
-                    out(if ok { 0 } else { 1 }, if ok { "{\"message\": \"done\", \"return\": \"OK\"}" } else { "{\"return\": \"NOK\"}" })
-                }
+                "sc" => match args[1] {
+                    "ruleset-reload-time" => {
+                        let mut n = self.reloaded.get();
+                        if n > 0 && self.slow_polls.get() > 0 {
+                            self.slow_polls.set(self.slow_polls.get() - 1);
+                            n -= 1; // still the old timestamp
+                        }
+                        out(
+                            0,
+                            &format!(
+                                "{{\"message\":[{{\"id\":0,\"last_reload\":\"T{}\"}}],\"return\":\"OK\"}}",
+                                if self.stuck { 0 } else { n }
+                            ),
+                        )
+                    }
+                    "ruleset-stats" => out(
+                        0,
+                        &format!(
+                            "{{\"message\":[{{\"id\":0,\"rules_loaded\":1,\"rules_failed\":{},\"rules_skipped\":0}}],\"return\":\"OK\"}}",
+                            if self.reloaded.get() > 0 { self.failed_after } else { 0 }
+                        ),
+                    ),
+                    _ => {
+                        let ok = self.reloads.borrow_mut().pop().unwrap_or(true);
+                        if ok {
+                            self.reloaded.set(self.reloaded.get() + 1);
+                        }
+                        out(if ok { 0 } else { 1 }, if ok { "{\"message\": \"done\", \"return\": \"OK\"}" } else { "{\"return\": \"NOK\"}" })
+                    }
+                },
                 "/usr/bin/logger" => out(0, ""),
                 other => panic!("unexpected program {other}"),
             }
@@ -1044,6 +1123,7 @@ mod tests {
             suricata_update: "su".into(),
             suricatasc: "sc".into(),
             require_root: false,
+            reload_wait_secs: 0,
         };
         fs::write(&p.rules, live).unwrap();
         fs::write(&p.disable_conf, dc).unwrap();
@@ -1391,5 +1471,47 @@ mod tests {
         fs::write(t.0.join("secret"), "x\n").unwrap();
         std::os::unix::fs::symlink(t.0.join("secret"), &p.suricata_log).unwrap();
         assert!(matches!(read_log(&p, "suricata", &mut Vec::new()), Err(ReadError::Other(m)) if m.contains("not a regular file")));
+    }
+
+    // ---- the reload is waited for ----
+
+    #[test]
+    fn the_change_is_only_reported_after_the_reload_finished() {
+        let live = rules(&[R_ON, R2]);
+        let (_t, mut p) = setup("slowreload", &live, "5\n");
+        p.reload_wait_secs = 10;
+        let f = Fake::ok(rules(&[R_OFF, R2]));
+        f.slow_polls.set(3); // the old timestamp is shown for three more polls
+        let start = std::time::Instant::now();
+        let rep = apply(&p, &f, Verb::Disable, 100).unwrap();
+        assert!(rep.lines.iter().any(|l| l.contains("sid 100 disabled")), "{rep:?}");
+        assert_eq!(f.slow_polls.get(), 0, "all slow polls were waited out");
+        assert!(start.elapsed() >= std::time::Duration::from_millis(1000), "it really waited");
+        let polls = f.calls.borrow().iter().filter(|c| c.contains("ruleset-reload-time")).count();
+        assert!(polls >= 4, "{polls}");
+    }
+
+    #[test]
+    fn a_reload_that_never_finishes_is_undone() {
+        let live = rules(&[R_ON, R2]);
+        let (_t, p) = setup("stuck", &live, "5\n"); // reload_wait_secs = 0
+        let mut f = Fake::ok(rules(&[R_OFF, R2]));
+        f.stuck = true;
+        let e = apply(&p, &f, Verb::Disable, 100).unwrap_err();
+        assert!(e.contains("did not finish"), "{e}");
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
+        assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "5\n");
+    }
+
+    #[test]
+    fn rules_that_fail_to_load_after_the_reload_undo_the_change() {
+        let live = rules(&[R_ON, R2]);
+        let (_t, p) = setup("failedrules", &live, "5\n");
+        let mut f = Fake::ok(rules(&[R_OFF, R2]));
+        f.failed_after = 3;
+        let e = apply(&p, &f, Verb::Disable, 100).unwrap_err();
+        assert!(e.contains("could not load 3 rules"), "{e}");
+        assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
+        assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "5\n");
     }
 }

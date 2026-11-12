@@ -296,6 +296,7 @@ mod tests {
         build_rules: String,
         build_class: Option<String>,
         reloads: RefCell<Vec<bool>>,
+        reloaded: std::cell::Cell<u32>,
     }
 
     fn out(code: i32, stdout: &str) -> Result<Out, String> {
@@ -324,8 +325,12 @@ mod tests {
                     "version" => out(0, "{\"message\":\"8.0.7 RELEASE\",\"return\":\"OK\"}"),
                     "uptime" => out(0, "{\"message\":3700,\"return\":\"OK\"}"),
                     "ruleset-stats" => out(0, "{\"message\":[{\"id\":0,\"rules_loaded\":28780,\"rules_failed\":2,\"rules_skipped\":0}],\"return\":\"OK\"}"),
+                    "ruleset-reload-time" => out(0, &format!("{{\"message\":[{{\"id\":0,\"last_reload\":\"T{}\"}}],\"return\":\"OK\"}}", self.reloaded.get())),
                     _ => {
                         let ok = self.reloads.borrow_mut().pop().unwrap_or(true);
+                        if ok {
+                            self.reloaded.set(self.reloaded.get() + 1);
+                        }
                         out(if ok { 0 } else { 1 }, if ok { "{\"message\":\"done\",\"return\":\"OK\"}" } else { "{\"return\":\"NOK\"}" })
                     }
                 },
@@ -342,6 +347,7 @@ mod tests {
             build_rules: build,
             build_class: None,
             reloads: RefCell::new(vec![true]),
+            reloaded: std::cell::Cell::new(0),
         }
     }
 
@@ -374,6 +380,7 @@ mod tests {
             suricata_update: "su".into(),
             suricatasc: "sc".into(),
             require_root: false,
+            reload_wait_secs: 0,
         };
         fs::write(&p.rules, live).unwrap();
         fs::write(&p.disable_conf, "5\n").unwrap();
