@@ -2,7 +2,6 @@
 
 use crate::local::{CatalogEntry, DisableConf};
 use std::collections::HashMap;
-use std::process::Command;
 
 pub const ALL: &str = "All";
 
@@ -310,26 +309,17 @@ pub fn build_sources(enabled: Vec<Source>, all: Vec<Source>) -> SourcesView {
     }
 }
 
-fn run_update(arg: &str) -> Result<String, String> {
-    let out = Command::new("suricata-update")
-        .arg(arg)
-        .output()
-        .map_err(|e| format!("cannot run suricata-update: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("suricata-update {arg} failed"));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Read the source index and the enabled sources (read-only).
-pub fn load_sources() -> SourcesView {
-    match (run_update("list-enabled-sources"), run_update("list-sources")) {
-        (Ok(en), Ok(all)) => build_sources(parse_sources(&en), parse_sources(&all)),
-        (Err(e), _) | (_, Err(e)) => SourcesView {
-            error: Some(e),
+/// Build the screen from the helper's `sources` output: the enabled sources,
+/// the marker line, then the index.
+pub fn sources_from_lines(lines: &[String]) -> SourcesView {
+    let at = lines.iter().position(|l| l == crate::sources::SEPARATOR);
+    let Some(at) = at else {
+        return SourcesView {
+            error: Some("unexpected answer from the helper".to_string()),
             ..Default::default()
-        },
-    }
+        };
+    };
+    build_sources(parse_sources(&lines[..at].join("\n")), parse_sources(&lines[at + 1..].join("\n")))
 }
 
 #[cfg(test)]

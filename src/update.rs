@@ -184,21 +184,33 @@ fn run_update_build(paths: &Paths, runner: &dyn Runner) -> Result<String, String
     fs::read_to_string(paths.build_dir.join("suricata.rules")).map_err(|e| io("the update produced no rules file", e))
 }
 
-/// Download and install the newest rules, like the daily job, but checked.
-pub fn apply_update(paths: &Paths, runner: &dyn Runner) -> Result<Report, String> {
-    let mut rep = Report::default();
+/// Root check, the helper lock, and "no other update is running". The lock is
+/// held until the returned guard is dropped.
+pub(crate) fn begin(paths: &Paths, runner: &dyn Runner) -> Result<Lock, String> {
     if paths.require_root {
         let id = runner.run("/usr/bin/id", &["-u"])?;
         if id.stdout.trim() != "0" {
             return Err("suritui-admin must run as root (through sudo)".into());
         }
     }
-    let _lock = Lock::take(&paths.lock, runner)?;
+    let lock = Lock::take(&paths.lock, runner)?;
     for p in ["suricata-update", "suricata-update-reload"] {
         if runner.run("/bin/pgrep", &["-f", p]).map(|o| o.code == Some(0)).unwrap_or(false) {
             return Err("a rule update is running right now; try again after it finishes".into());
         }
     }
+    Ok(lock)
+}
+
+/// Download and install the newest rules, like the daily job, but checked.
+pub fn apply_update(paths: &Paths, runner: &dyn Runner) -> Result<Report, String> {
+    let _lock = begin(paths, runner)?;
+    update_locked(paths, runner)
+}
+
+/// The update itself; the caller holds the lock (see `begin`).
+pub(crate) fn update_locked(paths: &Paths, runner: &dyn Runner) -> Result<Report, String> {
+    let mut rep = Report::default();
     let rules_meta = plain_file(&paths.rules)?;
     let live_rules = fs::read_to_string(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
     let class_path = paths.rules.with_file_name("classification.config");

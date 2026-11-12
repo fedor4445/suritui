@@ -11,6 +11,7 @@ pub mod settings;
 pub mod threshold;
 pub mod update;
 pub mod source;
+pub mod sources;
 pub mod ui;
 
 #[cfg(test)]

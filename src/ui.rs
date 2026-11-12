@@ -101,7 +101,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         Mode::Rules if app.can_change() => "  / search   s state   d disable   e enable   Enter rule   1 alerts",
         Mode::Rules => "  / search   s state   c clear   Enter rule   1 alerts   3 sources",
-        Mode::Sources => "  R reload   1 alerts   2 rules   Esc back",
+        Mode::Sources => "  j k move   e switch on   d switch off   R reload   1 alerts   2 rules   Esc back",
         Mode::Updates if app.can_change() => "  U update now   R reload   1 alerts   2 rules   3 sources",
         Mode::Updates => "  R reload   1 alerts   2 rules   3 sources",
         Mode::Thresholds => "  x remove   R reload   1 alerts   2 rules   4 updates",
@@ -546,6 +546,8 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
         Action::Rule(crate::admin::Verb::Disable, sid) => format!("Disable rule {sid}?"),
         Action::Rule(crate::admin::Verb::Enable, sid) => format!("Enable rule {sid}?"),
         Action::Update => "Update the rules now?".to_string(),
+        Action::Source { enable: true, name } => format!("Switch on the source {name}?"),
+        Action::Source { enable: false, name } => format!("Switch off the source {name}?"),
         Action::Suppress { add: true, sid, track, ip } => format!(
             "Silence rule {sid} for {} {ip}?",
             if *track == crate::threshold::Track::BySrc { "source" } else { "destination" }
@@ -558,6 +560,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
         Line::default(),
         Line::from(match &p.action {
             Action::Suppress { .. } => format!("This {}; Suricata checks the new file and reloads it live.", p.how),
+            Action::Source { .. } => format!("This {}.", p.how),
             _ => format!("This {}, rebuilds the rules and reloads Suricata live.", p.how),
         }),
         Line::from(match &p.action {
@@ -637,6 +640,9 @@ fn draw_working(f: &mut Frame, app: &App, area: Rect) {
             match &j.action {
                 Action::Rule(v, sid) => format!("{} rule {sid}", v.word()),
                 Action::Update => "updating the rules".to_string(),
+                Action::Source { enable, name } => {
+                    format!("{} the source {name}", if *enable { "switching on" } else { "switching off" })
+                }
                 Action::Suppress { add: true, sid, .. } => format!("silencing rule {sid}"),
                 Action::Suppress { add: false, sid, .. } => format!("removing the suppress entry of rule {sid}"),
             },
@@ -671,53 +677,55 @@ fn draw_done(f: &mut Frame, app: &App, area: Rect) {
     scroll_screen(f, app, area, if ok { "Change finished" } else { "Change failed" }, lines);
 }
 
-fn source_line(s: &crate::browser::Source) -> Line<'static> {
+fn source_text(s: &crate::browser::Source) -> String {
     let mut text = format!("{:<28} {:<12} {}", s.name, s.license, s.summary);
     if let Some(r) = &s.replaces {
         text.push_str(&format!(" (replaces {r})"));
     }
-    plain(&text)
+    text
 }
 
 fn draw_sources(f: &mut Frame, app: &App, area: Rect) {
+    let w = area.width as usize;
+    let h = (area.height as usize).saturating_sub(1);
     let Some(v) = &app.sources else {
-        return scroll_screen(f, app, area, "Rule sources", vec![Line::from("Not loaded.")]);
+        return f.render_widget(Paragraph::new("Not loaded."), area);
     };
     if let Some(e) = &v.error {
-        return scroll_screen(
-            f,
-            app,
-            area,
-            "Rule sources",
-            vec![Line::from(format!("Could not read the sources: {e}"))],
-        );
+        return f.render_widget(Paragraph::new(format!("Could not read the sources: {e}")), area);
     }
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(Span::styled("Enabled", header_style())));
+    let sel = app.src_sel.min((v.enabled.len() + v.free.len()).saturating_sub(1));
+    // (line, is the selected row)
+    let mut rows: Vec<(Line<'static>, bool)> = Vec::new();
+    let head = |t: String| (Line::from(Span::styled(fit(&t, w), header_style())), false);
+    let item = |s: &crate::browser::Source, idx: usize| {
+        let style = if idx == sel { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+        (Line::from(Span::styled(fit(&source_text(s), w), style)), idx == sel)
+    };
+    rows.push(head("Enabled".to_string()));
     if v.enabled.is_empty() {
-        lines.push(Line::from(
-            "None set up explicitly: suricata-update falls back to et/open.",
-        ));
-    } else {
-        lines.extend(v.enabled.iter().map(source_line));
+        rows.push((Line::from("None set up explicitly: suricata-update falls back to et/open."), false));
     }
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        format!("Free sources available ({})", v.free.len()),
-        header_style(),
-    )));
-    lines.extend(v.free.iter().map(source_line));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        format!("Need a key or subscription ({})", v.keyed.len()),
-        header_style(),
-    )));
-    lines.extend(v.keyed.iter().map(source_line));
-    lines.push(Line::default());
-    lines.push(Line::from(
-        "Read-only: enabling sources is not built yet. Keys are not supported yet.",
-    ));
-    scroll_screen(f, app, area, "Rule sources", lines);
+    for (i, s) in v.enabled.iter().enumerate() {
+        rows.push(item(s, i));
+    }
+    rows.push((Line::default(), false));
+    rows.push(head(format!("Free sources available ({})   e switches the highlighted one on", v.free.len())));
+    for (i, s) in v.free.iter().enumerate() {
+        rows.push(item(s, v.enabled.len() + i));
+    }
+    rows.push((Line::default(), false));
+    rows.push(head(format!("Need a key or subscription ({})", v.keyed.len())));
+    for s in &v.keyed {
+        rows.push((Line::from(Span::styled(fit(&source_text(s), w), Style::default().add_modifier(Modifier::DIM))), false));
+    }
+    rows.push((Line::default(), false));
+    rows.push((Line::from("Keys are not supported yet."), false));
+    let at = rows.iter().position(|(_, s)| *s).unwrap_or(0);
+    let top = if h == 0 || at < h { 0 } else { at + 1 - h };
+    let mut lines = vec![Line::from(Span::styled(fit("Rule sources", w), header_style()))];
+    lines.extend(rows.into_iter().skip(top).take(h).map(|(l, _)| l));
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
@@ -740,6 +748,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("5, x", "suppress list; x removes the highlighted entry"),
         ("6 / 7", "settings (read-only) / logs (Tab: next log)"),
         ("d / e", "disable / enable a rule: rules list, rule screen; d on an alert (router)"),
+        ("3, j k, e / d", "sources: move, switch the highlighted free source on / off"),
         ("y", "confirm a change (Esc cancels)"),
         ("/ s c", "rules: search / state filter / clear"),
         ("?", "this help"),
@@ -1086,7 +1095,7 @@ mod tests {
     fn help_screen_lists_keys() {
         let mut a = sample();
         a.mode = Mode::Help;
-        let s = screen(&a, 100, 24);
+        let s = screen(&a, 100, 30);
         assert!(s.contains("Tab") && s.contains("quit"));
     }
 
@@ -1941,6 +1950,67 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         key(&mut a, 'd');
         assert_eq!(a.mode, Mode::Detail);
         assert!(a.status.contains("no rules"), "{}", a.status);
+    }
+
+    // ---- Sources: switching free sources ----
+
+    struct FakeSrc {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Admin for FakeSrc {
+        fn available(&self) -> bool {
+            true
+        }
+        fn change(&self, _v: Verb, _sid: u64) -> Result<Vec<String>, String> {
+            Ok(vec![])
+        }
+        fn sources(&self) -> Result<Vec<String>, String> {
+            Ok("Name: et/open\n  Summary: ET Open\n  License: MIT\n=====index=====\nName: et/open\n  Summary: ET Open\n  License: MIT\nName: abuse.ch/urlhaus\n  Summary: URLhaus rules\n  License: CC0-1.0\nName: et/pro\n  License: Commercial\n  Parameters: secret-code\n"
+                .lines()
+                .map(str::to_string)
+                .collect())
+        }
+        fn source(&self, enable: bool, name: &str) -> Result<Vec<String>, String> {
+            self.calls.lock().unwrap().push(format!("{enable} {name}"));
+            Ok(vec!["rules updated".to_string()])
+        }
+        fn reload(&self) -> Result<(RuleIndex, DisableConf), String> {
+            Ok((RuleIndex::from_text(RULES), DisableConf::default()))
+        }
+    }
+
+    #[test]
+    fn a_free_source_is_switched_on_after_a_confirm() {
+        let mut a = rules_app();
+        let fake = Arc::new(FakeSrc { calls: Default::default() });
+        a.set_admin(fake.clone());
+        press(&mut a, KeyCode::Esc);
+        key(&mut a, '3');
+        assert_eq!(a.mode, Mode::Sources);
+        let s = screen(&a, 110, 20);
+        assert!(s.contains("Free sources available (1)") && s.contains("Need a key or subscription (1)"), "{s}");
+        // et/open (enabled) is highlighted first: e says it is already on, d asks.
+        key(&mut a, 'e');
+        assert_eq!(a.mode, Mode::Sources);
+        assert!(a.status.contains("already enabled"), "{}", a.status);
+        key(&mut a, 'j');
+        key(&mut a, 'e');
+        assert_eq!(a.mode, Mode::Confirm);
+        let s = screen(&a, 110, 20);
+        assert!(s.contains("Switch on the source abuse.ch/urlhaus?"), "{s}");
+        key(&mut a, 'y');
+        for _ in 0..200 {
+            a.poll_job();
+            if a.mode == Mode::Done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(a.mode, Mode::Done);
+        assert_eq!(*fake.calls.lock().unwrap(), vec!["true abuse.ch/urlhaus".to_string()]);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Sources);
     }
 
     // ---- Updates screen ----

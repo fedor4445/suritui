@@ -56,7 +56,6 @@ impl Mode {
                 | Mode::Raw
                 | Mode::Help
                 | Mode::RuleInfo
-                | Mode::Sources
                 | Mode::Confirm
                 | Mode::Done
                 | Mode::Updates
@@ -102,6 +101,7 @@ pub struct App {
     rules: Option<RuleIndex>,
     pub browser: Option<RulesBrowser>,
     pub sources: Option<SourcesView>,
+    pub src_sel: usize,
     admin: Option<Arc<dyn Admin>>,
     pub pending: Option<Pending>,
     pub job: Option<Job>,
@@ -147,6 +147,7 @@ impl App {
             rules,
             browser: None,
             sources: None,
+            src_sel: 0,
             admin: None,
             pending: None,
             job: None,
@@ -295,21 +296,90 @@ impl App {
         self.set_mode(Mode::Rules);
     }
 
-    /// Open the Sources screen (router only: it asks suricata-update).
+    /// Open the Sources screen (router only: it asks the helper).
     pub fn open_sources(&mut self) {
-        if !self.cfg.local {
+        if self.admin.is_none() {
             self.status = "rule sources are only available on the router (use --local)".to_string();
             return;
         }
         if self.sources.is_none() {
-            self.sources = Some(browser::load_sources());
+            self.reload_sources();
         }
         self.status.clear();
         self.set_mode(Mode::Sources);
     }
 
     pub fn reload_sources(&mut self) {
-        self.sources = Some(browser::load_sources());
+        let view = match self.admin.as_ref().map(|a| a.sources()) {
+            Some(Ok(lines)) => browser::sources_from_lines(&lines),
+            Some(Err(e)) => SourcesView { error: Some(e), ..Default::default() },
+            None => SourcesView {
+                error: Some("the helper suritui-admin is not available here".to_string()),
+                ..Default::default()
+            },
+        };
+        let n = view.enabled.len() + view.free.len();
+        self.src_sel = self.src_sel.min(n.saturating_sub(1));
+        self.sources = Some(view);
+    }
+
+    /// The sources that can be picked: enabled ones first, then free ones.
+    pub fn source_items(&self) -> Vec<(&browser::Source, bool)> {
+        match &self.sources {
+            Some(v) if v.error.is_none() => v
+                .enabled
+                .iter()
+                .map(|s| (s, true))
+                .chain(v.free.iter().map(|s| (s, false)))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn move_source(&mut self, delta: i32) {
+        let n = self.source_items().len();
+        self.src_sel = if n == 0 { 0 } else { (self.src_sel as i64 + delta as i64).clamp(0, n as i64 - 1) as usize };
+    }
+
+    /// `e` / `d` on the Sources screen: ask first.
+    pub fn request_source_change(&mut self, enable: bool) {
+        let Some(admin) = &self.admin else { return };
+        if !admin.available() {
+            self.status = "the helper suritui-admin is not installed here".to_string();
+            return;
+        }
+        let items = self.source_items();
+        let Some((src, on)) = items.get(self.src_sel).map(|(s, on)| ((*s).clone(), *on)) else { return };
+        if enable == on {
+            self.status = if on {
+                "this source is already enabled (d switches it off)".to_string()
+            } else {
+                "this source is not enabled (e switches it on)".to_string()
+            };
+            return;
+        }
+        let first = enable && self.sources.as_ref().is_some_and(|v| v.enabled.is_empty()) && src.name != "et/open";
+        let how = if enable {
+            let mut h = "downloads the rules of this source together with the others and installs them \
+                         (about 2 minutes); if anything fails the source is switched off again"
+                .to_string();
+            if first {
+                h.push_str("; et/open is listed explicitly too, so it stays in use");
+            }
+            h
+        } else {
+            "switches the source off and installs the rule set without it (about 2 minutes); if anything fails \
+             the source is switched on again"
+                .to_string()
+        };
+        self.status.clear();
+        self.pending = Some(Pending {
+            action: Action::Source { enable, name: src.name.clone() },
+            msg: format!("{} the source {}: {}", if enable { "Switch on" } else { "Switch off" }, src.name, src.summary),
+            how,
+            from: self.mode,
+        });
+        self.set_mode(Mode::Confirm);
     }
 
     /// Text of the rule picked in the browser.
@@ -416,6 +486,7 @@ impl App {
         // Back to where the change started: the alert list for an alert's rule.
         self.after_done = match (&action, p.from) {
             (Action::Update, _) => Mode::Updates,
+            (Action::Source { .. }, _) => Mode::Sources,
             (Action::Suppress { .. }, Mode::Thresholds) => Mode::Thresholds,
             (_, Mode::Detail | Mode::Rule) => Mode::List,
             _ => Mode::Rules,
@@ -473,6 +544,9 @@ impl App {
         self.outcome = None;
         if self.after_done == Mode::Updates {
             self.load_updates();
+        }
+        if self.after_done == Mode::Sources {
+            self.reload_sources();
         }
         if self.after_done == Mode::Thresholds {
             self.load_thresholds();

@@ -20,6 +20,8 @@ pub enum Action {
     Suppress { add: bool, sid: u64, track: Track, ip: String },
     /// Download and install the newest rules now.
     Update,
+    /// Switch a free rule source on or off, then install the new rule set.
+    Source { enable: bool, name: String },
 }
 
 /// What the user is being asked to confirm.
@@ -41,6 +43,14 @@ pub trait Admin: Send + Sync {
     /// Download and install the newest rules.
     fn update(&self) -> Result<Vec<String>, String> {
         Err("updating is not available here".to_string())
+    }
+    /// The source lists (see `sources::list`).
+    fn sources(&self) -> Result<Vec<String>, String> {
+        Err("rule sources are not available here".to_string())
+    }
+    /// Switch a source on or off.
+    fn source(&self, _enable: bool, _name: &str) -> Result<Vec<String>, String> {
+        Err("changing sources is not available here".to_string())
     }
     /// The text of the Updates screen.
     fn info(&self) -> Result<Vec<String>, String> {
@@ -66,6 +76,7 @@ pub trait Admin: Send + Sync {
         match a {
             Action::Rule(v, sid) => self.change(*v, *sid),
             Action::Update => self.update(),
+            Action::Source { enable, name } => self.source(*enable, name),
             Action::Suppress { add, sid, track, ip } => self.suppress(*add, *sid, *track, ip),
         }
     }
@@ -112,6 +123,14 @@ impl Admin for LocalAdmin {
 
     fn info(&self) -> Result<Vec<String>, String> {
         run_helper(&["info"])
+    }
+
+    fn sources(&self) -> Result<Vec<String>, String> {
+        run_helper(&["sources"])
+    }
+
+    fn source(&self, enable: bool, name: &str) -> Result<Vec<String>, String> {
+        run_helper(&["source", if enable { "enable" } else { "disable" }, name])
     }
 
     fn suppress(&self, add: bool, sid: u64, track: Track, ip: &str) -> Result<Vec<String>, String> {
