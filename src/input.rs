@@ -19,6 +19,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
+    if app.mode == Mode::Rules && app.browser.as_ref().is_some_and(|b| b.editing) {
+        search_key(app, key.code);
+        return false;
+    }
     if key.code == KeyCode::Char('q') {
         return true;
     }
@@ -41,6 +45,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (Mode::List, KeyCode::Char(']')) => app.change_day(-1),
         (Mode::List, KeyCode::Char('R')) => app.refresh(),
         (Mode::List, KeyCode::Char('?')) => app.set_mode(Mode::Help),
+        (Mode::List, KeyCode::Char('2')) => app.open_rules(),
+        (Mode::List, KeyCode::Char('3')) => app.open_sources(),
+        (Mode::Rules | Mode::Sources, KeyCode::Char('1')) => app.set_mode(Mode::List),
+        (Mode::Rules, KeyCode::Char('3')) => app.open_sources(),
+        (Mode::Sources, KeyCode::Char('2')) => app.open_rules(),
+        (Mode::Sources, KeyCode::Char('R')) => app.reload_sources(),
+        (Mode::Rules, code) => rules_key(app, code),
         (m, KeyCode::Char('j') | KeyCode::Down) if m.scrolls() => app.scroll_lines(1),
         (m, KeyCode::Char('k') | KeyCode::Up) if m.scrolls() => app.scroll_lines(-1),
         (m, KeyCode::PageDown) if m.scrolls() => app.scroll_page(1),
@@ -49,12 +60,54 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (m, KeyCode::Char('G') | KeyCode::End) if m.scrolls() => app.scroll_to_bottom(),
         (Mode::Detail, KeyCode::Char('r')) => app.set_mode(Mode::Rule),
         (Mode::Detail, KeyCode::Char('w')) => app.set_mode(Mode::Raw),
-        (Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help, KeyCode::Esc) => {
+        (Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help | Mode::Sources, KeyCode::Esc) => {
             app.set_mode(Mode::List)
         }
+        (Mode::RuleInfo, KeyCode::Esc) => app.set_mode(Mode::Rules),
         _ => {}
     }
     false
+}
+
+/// Keys of the Rules browser (not while typing a search).
+fn rules_key(app: &mut App, code: KeyCode) {
+    if code == KeyCode::Enter {
+        if app.browser.as_ref().is_some_and(|b| b.selected().is_some()) {
+            app.set_mode(Mode::RuleInfo);
+        }
+        return;
+    }
+    if code == KeyCode::Esc {
+        app.set_mode(Mode::List);
+        return;
+    }
+    let Some(b) = app.browser.as_mut() else { return };
+    match code {
+        KeyCode::Tab => b.next_category(),
+        KeyCode::BackTab => b.prev_category(),
+        KeyCode::Char('j') | KeyCode::Down => b.move_selection(1),
+        KeyCode::Char('k') | KeyCode::Up => b.move_selection(-1),
+        KeyCode::Char('g') | KeyCode::Home => b.move_selection(i32::MIN),
+        KeyCode::Char('G') | KeyCode::End => b.move_selection(i32::MAX),
+        KeyCode::PageUp => b.move_selection(-20),
+        KeyCode::PageDown => b.move_selection(20),
+        KeyCode::Char('/') => b.start_search(),
+        KeyCode::Char('s') => b.cycle_filter(),
+        KeyCode::Char('c') => b.clear_search(),
+        _ => {}
+    }
+}
+
+/// Keys while a search is being typed: everything is text except these.
+fn search_key(app: &mut App, code: KeyCode) {
+    let Some(b) = app.browser.as_mut() else { return };
+    match code {
+        KeyCode::Esc => b.clear_search(),
+        KeyCode::Enter => b.finish_search(),
+        KeyCode::Backspace => b.backspace(),
+        KeyCode::Char(c) => b.type_char(c),
+        _ => {}
+    }
 }
 
 #[cfg(test)]

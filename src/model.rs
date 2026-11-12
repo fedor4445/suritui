@@ -1,7 +1,10 @@
-//! Application model: state and transitions, no I/O beyond the `AlertSource`.
+//! Application model: state and transitions. I/O is limited to the
+//! `AlertSource`, the local rule files and `suricata-update` (read-only).
 
 use crate::alert::{category, is_informational, Alert};
+use crate::browser::{self, RulesBrowser, SourcesView};
 use crate::config::Config;
+use crate::local::{self, DisableConf};
 use crate::rules::{rev_warning, RuleIndex};
 use crate::source::{AlertSource, Loaded, Range, SourceError};
 use std::cell::Cell;
@@ -17,12 +20,21 @@ pub enum Mode {
     Rule,
     Raw,
     Help,
+    /// The Rules browser (every loaded rule with its state).
+    Rules,
+    /// One rule from the browser.
+    RuleInfo,
+    /// Rule sources.
+    Sources,
 }
 
 impl Mode {
     /// Screens that scroll (all drawn with `scroll_screen` in ui.rs).
     pub fn scrolls(self) -> bool {
-        matches!(self, Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help)
+        matches!(
+            self,
+            Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help | Mode::RuleInfo | Mode::Sources
+        )
     }
 }
 
@@ -60,6 +72,8 @@ pub struct App {
     cfg: Config,
     source: Box<dyn AlertSource>,
     rules: Option<RuleIndex>,
+    pub browser: Option<RulesBrowser>,
+    pub sources: Option<SourcesView>,
     cache: HashMap<Range, Loaded>,
     pub mode: Mode,
     pub range: Range,
@@ -92,6 +106,8 @@ impl App {
             cfg,
             source,
             rules,
+            browser: None,
+            sources: None,
             cache: HashMap::new(),
             mode: Mode::List,
             range: Range::Today,
@@ -209,6 +225,51 @@ impl App {
         if len == 0 && matches!(self.mode, Mode::Detail | Mode::Rule | Mode::Raw) {
             self.set_mode(Mode::List);
         }
+    }
+
+    /// Open the Rules browser, building the catalog on first use.
+    pub fn open_rules(&mut self) {
+        if self.browser.is_none() {
+            let Some(idx) = &self.rules else {
+                self.status = "no rules are loaded here".to_string();
+                return;
+            };
+            let disable = if self.cfg.local {
+                local::load_disable_conf()
+            } else {
+                DisableConf::default()
+            };
+            self.browser = Some(RulesBrowser::new(local::catalog(idx), disable));
+        }
+        self.status.clear();
+        self.set_mode(Mode::Rules);
+    }
+
+    /// Open the Sources screen (router only: it asks suricata-update).
+    pub fn open_sources(&mut self) {
+        if !self.cfg.local {
+            self.status = "rule sources are only available on the router (use --local)".to_string();
+            return;
+        }
+        if self.sources.is_none() {
+            self.sources = Some(browser::load_sources());
+        }
+        self.status.clear();
+        self.set_mode(Mode::Sources);
+    }
+
+    pub fn reload_sources(&mut self) {
+        self.sources = Some(browser::load_sources());
+    }
+
+    /// Text of the rule picked in the browser.
+    pub fn browser_rule(&self) -> Option<&crate::rules::Rule> {
+        let sid = self.browser.as_ref()?.selected()?.sid;
+        self.rules.as_ref()?.lookup(sid)
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.cfg.local
     }
 
     /// Change screen; the scroll position goes back to the top.
@@ -403,6 +464,21 @@ impl App {
     }
 
     pub fn status_line(&self) -> String {
+        if let (Mode::Rules | Mode::RuleInfo, Some(b)) = (self.mode, &self.browser) {
+            let mut s = format!(
+                "{} rules, {} disabled",
+                group(b.total()),
+                group(b.disabled_total())
+            );
+            if !self.status.is_empty() {
+                s.push_str(" | ");
+                s.push_str(&self.status);
+            }
+            return s;
+        }
+        if self.mode == Mode::Sources {
+            return "rule sources".to_string();
+        }
         let shown = self.visible().len();
         let hidden = self.hidden_count();
         let mut s = if shown == 0 && hidden == 0 {
@@ -429,7 +505,7 @@ impl App {
 }
 
 /// Thousands separator: 5277 -> "5,277".
-fn group(n: usize) -> String {
+pub(crate) fn group(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {

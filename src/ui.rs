@@ -1,7 +1,7 @@
 //! Rendering: sidebar, list, detail, rule, raw and help screens.
 
 use crate::alert::Alert;
-use crate::model::{App, Mode, RuleView};
+use crate::model::{group, App, Mode, RuleView};
 use crate::source::Range;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -73,10 +73,21 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Rule => draw_rule(f, app, body),
         Mode::Raw => draw_raw(f, app, body),
         Mode::Help => draw_help(f, app, body),
+        Mode::Rules => {
+            let sw = (body.width / 3).min(SIDEBAR_MAX);
+            let [side, list] =
+                Layout::horizontal([Constraint::Length(sw), Constraint::Min(0)]).areas(body);
+            draw_rules_sidebar(f, app, side);
+            draw_rules_list(f, app, list);
+        }
+        Mode::RuleInfo => draw_rule_info(f, app, body),
+        Mode::Sources => draw_sources(f, app, body),
     }
     let hint = match app.mode {
-        Mode::List => "  ? help",
+        Mode::List => "  ? help   2 rules   3 sources",
         Mode::Detail => "  Esc back   r rule text   w raw JSON",
+        Mode::Rules => "  / search   s state   c clear   Enter rule   1 alerts   3 sources",
+        Mode::Sources => "  R reload   1 alerts   2 rules   Esc back",
         _ => "  Esc back",
     };
     let left = Paragraph::new(Line::from(vec![
@@ -380,6 +391,173 @@ fn draw_raw(f: &mut Frame, app: &App, area: Rect) {
     scroll_screen(f, app, area, "Raw JSON", lines);
 }
 
+/// Category rows with the current one kept in view (header pinned).
+fn category_rows(
+    cats: &[(String, usize)],
+    current: &str,
+    w: usize,
+    h: usize,
+    title: &str,
+) -> Vec<Line<'static>> {
+    let sel = cats.iter().position(|(c, _)| c == current).unwrap_or(0);
+    let offset = if h == 0 || sel < h { 0 } else { sel + 1 - h };
+    let mut lines = vec![Line::from(Span::styled(fit(title, w), header_style()))];
+    for (label, n) in cats.iter().skip(offset).take(h) {
+        let count = n.to_string();
+        let lw = w.saturating_sub(count.chars().count() + 1);
+        let text = format!("{} {}", fit(label, lw), count);
+        let style = if label == current {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(fit(&text, w), style)));
+    }
+    lines
+}
+
+fn draw_rules_sidebar(f: &mut Frame, app: &App, area: Rect) {
+    let Some(b) = &app.browser else { return };
+    let w = (area.width as usize).saturating_sub(1);
+    let h = (area.height as usize).saturating_sub(1);
+    let lines = category_rows(&b.categories(), b.category(), w, h, "Categories");
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_rules_list(f: &mut Frame, app: &App, area: Rect) {
+    let Some(b) = &app.browser else { return };
+    let w = area.width as usize;
+    let rows = b.visible();
+    let mut head = format!(
+        "Rules  {}  {} of {}  [{}]",
+        b.category(),
+        group(rows.len()),
+        group(b.total()),
+        b.filter.label()
+    );
+    if b.editing {
+        head.push_str(&format!("  search: {}_", b.query()));
+    } else if !b.query().is_empty() {
+        head.push_str(&format!("  search: {}", b.query()));
+    }
+    let mut lines = vec![Line::from(Span::styled(fit(&head, w), header_style()))];
+    let h = (area.height as usize).saturating_sub(1);
+    if rows.is_empty() {
+        lines.push(Line::from("No rules match."));
+    } else {
+        let sel = b.selected_index();
+        let offset = if h == 0 || sel < h { 0 } else { sel + 1 - h };
+        for (i, e) in rows.iter().enumerate().skip(offset).take(h) {
+            let base = if i == sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else if e.enabled {
+                Style::default()
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            let state = if e.enabled { "on " } else { "OFF" };
+            let state_style = if e.enabled {
+                base
+            } else {
+                base.fg(Color::Red)
+            };
+            let mut left = w;
+            let mut spans = Vec::new();
+            for (text, style) in [
+                (format!("{:<9} ", e.sid), base),
+                (format!("{state} "), state_style),
+                (e.msg.clone(), base),
+            ] {
+                let cell: String = clean(&text).chars().take(left).collect();
+                left -= cell.chars().count();
+                spans.push(Span::styled(cell, style));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_rule_info(f: &mut Frame, app: &App, area: Rect) {
+    let (Some(b), Some(rule)) = (&app.browser, app.browser_rule()) else {
+        return scroll_screen(f, app, area, "Rule", vec![Line::from("No rule selected.")]);
+    };
+    let Some(e) = b.selected() else {
+        return scroll_screen(f, app, area, "Rule", vec![Line::from("No rule selected.")]);
+    };
+    let state_style = if e.enabled {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+    let mut lines = vec![
+        field("SID / rev", &format!("{} / {}", e.sid, rule.rev)),
+        field("Category", &e.category),
+        field_styled(
+            "State",
+            if e.enabled { "enabled" } else { "DISABLED" },
+            state_style,
+        ),
+        field("Why", crate::local::origin(e.enabled, e.sid, &b.disable)),
+        Line::default(),
+        plain(&rule.text),
+    ];
+    lines.push(Line::default());
+    lines.push(Line::from(
+        "This is the rule as Suricata loaded it. Changing rules is not built yet.",
+    ));
+    scroll_screen(f, app, area, "Rule", lines);
+}
+
+fn source_line(s: &crate::browser::Source) -> Line<'static> {
+    let mut text = format!("{:<28} {:<12} {}", s.name, s.license, s.summary);
+    if let Some(r) = &s.replaces {
+        text.push_str(&format!(" (replaces {r})"));
+    }
+    plain(&text)
+}
+
+fn draw_sources(f: &mut Frame, app: &App, area: Rect) {
+    let Some(v) = &app.sources else {
+        return scroll_screen(f, app, area, "Rule sources", vec![Line::from("Not loaded.")]);
+    };
+    if let Some(e) = &v.error {
+        return scroll_screen(
+            f,
+            app,
+            area,
+            "Rule sources",
+            vec![Line::from(format!("Could not read the sources: {e}"))],
+        );
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled("Enabled", header_style())));
+    if v.enabled.is_empty() {
+        lines.push(Line::from(
+            "None set up explicitly: suricata-update falls back to et/open.",
+        ));
+    } else {
+        lines.extend(v.enabled.iter().map(source_line));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        format!("Free sources available ({})", v.free.len()),
+        header_style(),
+    )));
+    lines.extend(v.free.iter().map(source_line));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        format!("Need a key or subscription ({})", v.keyed.len()),
+        header_style(),
+    )));
+    lines.extend(v.keyed.iter().map(source_line));
+    lines.push(Line::default());
+    lines.push(Line::from(
+        "Read-only: enabling sources is not built yet. Keys are not supported yet.",
+    ));
+    scroll_screen(f, app, area, "Rule sources", lines);
+}
+
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let keys = [
         ("Tab / Shift-Tab", "next / previous category"),
@@ -394,6 +572,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("r", "rule text (from detail)"),
         ("w", "raw JSON (from detail)"),
         ("R", "refresh"),
+        ("2 / 3 / 1", "rules / sources / alerts"),
+        ("/ s c", "rules: search / state filter / clear"),
         ("?", "this help"),
         ("q, Ctrl-C", "quit"),
     ];
@@ -1177,5 +1357,129 @@ mod tests {
         let mut a = sample();
         a.mode = Mode::Help;
         assert!(screen(&a, 100, 24).contains("scroll (detail, rule, raw, help)"));
+    }
+
+    // ---- rules browser ----
+
+    const RULES: &str = "\
+alert tcp any any -> any any (msg:\"ET SCAN nmap probe\"; sid:2000001; rev:3;)
+# alert tcp any any -> any any (msg:\"ET MALWARE bot beacon\"; sid:2000002; rev:1;)
+alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
+";
+
+    fn rules_app() -> App {
+        let mut a = app_with(
+            vec![(Range::Today, vec![])],
+            Some(crate::rules::RuleIndex::from_text(RULES)),
+        );
+        key(&mut a, '2');
+        a
+    }
+
+    #[test]
+    fn two_opens_the_rules_browser_with_states() {
+        let a = rules_app();
+        assert_eq!(a.mode, Mode::Rules);
+        let s = screen(&a, 100, 12);
+        assert!(s.contains("Rules  All  3 of 3"), "{s}");
+        assert!(s.contains("2000002") && s.contains("OFF"), "{s}");
+        assert!(s.contains("3 rules, 1 disabled"), "{s}");
+    }
+
+    #[test]
+    fn two_without_rules_stays_put_and_says_why() {
+        let mut a = app(vec![]);
+        key(&mut a, '2');
+        assert_eq!(a.mode, Mode::List);
+        assert!(a.status.contains("no rules"));
+    }
+
+    #[test]
+    fn typing_q_in_a_search_does_not_quit() {
+        let mut a = rules_app();
+        key(&mut a, '/');
+        assert!(!crate::input::handle_key(
+            &mut a,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+        ));
+        key(&mut a, 'x');
+        assert_eq!(a.browser.as_ref().unwrap().query(), "qx");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.browser.as_ref().unwrap().query(), "");
+        assert_eq!(a.mode, Mode::Rules);
+        // and q quits again once not searching
+        assert!(crate::input::handle_key(
+            &mut a,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn search_and_state_filter_narrow_the_list() {
+        let mut a = rules_app();
+        key(&mut a, 's'); // disabled only
+        let s = screen(&a, 100, 12);
+        assert!(s.contains("[disabled only]") && s.contains("2000002"), "{s}");
+        assert!(!s.contains("2000001"), "{s}");
+        key(&mut a, 's');
+        key(&mut a, 's'); // back to all
+        key(&mut a, '/');
+        for c in "nmap".chars() {
+            key(&mut a, c);
+        }
+        press(&mut a, KeyCode::Enter);
+        let s = screen(&a, 100, 12);
+        assert!(s.contains("1 of 3") && s.contains("search: nmap"), "{s}");
+    }
+
+    #[test]
+    fn enter_shows_the_rule_and_esc_returns_to_the_browser() {
+        let mut a = rules_app();
+        key(&mut a, 's'); // disabled only -> the malware rule
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::RuleInfo);
+        let s = screen(&a, 100, 14);
+        assert!(s.contains("DISABLED") && s.contains("bot beacon"), "{s}");
+        assert!(s.contains("disabled in the rule source"), "{s}");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::Rules);
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn sources_need_local_mode() {
+        let mut a = app(vec![]);
+        key(&mut a, '3');
+        assert_eq!(a.mode, Mode::List);
+        assert!(a.status.contains("--local"));
+    }
+
+    #[test]
+    fn sources_screen_renders_the_three_blocks() {
+        let mut a = app(vec![]);
+        a.sources = Some(crate::browser::build_sources(
+            vec![],
+            crate::browser::parse_sources(
+                "Name: et/open\n  Summary: ET Open\n  License: MIT\nName: et/pro\n  License: Commercial\n  Parameters: secret-code\n",
+            ),
+        ));
+        a.set_mode(Mode::Sources);
+        let s = screen(&a, 100, 16);
+        assert!(s.contains("falls back to et/open"), "{s}");
+        assert!(s.contains("Free sources available (1)"), "{s}");
+        assert!(s.contains("Need a key or subscription (1)"), "{s}");
+    }
+
+    #[test]
+    fn new_screens_do_not_panic_when_tiny() {
+        let mut a = rules_app();
+        for (w, h) in [(1, 1), (5, 2), (20, 3)] {
+            render(&a, w, h);
+        }
+        press(&mut a, KeyCode::Enter);
+        for (w, h) in [(1, 1), (5, 2), (20, 3)] {
+            render(&a, w, h);
+        }
     }
 }

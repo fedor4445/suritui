@@ -1,4 +1,5 @@
 pub mod alert;
+pub mod browser;
 pub mod config;
 pub mod input;
 pub mod local;
