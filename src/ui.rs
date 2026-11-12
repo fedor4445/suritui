@@ -86,6 +86,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     let hint = match app.mode {
         Mode::List => "  ? help   2 rules   3 sources",
         Mode::Detail => "  Esc back   r rule text   w raw JSON",
+        Mode::Rules if app.browser.as_ref().is_some_and(|b| b.editing) => {
+            "  typing a search: Enter keeps it, Esc drops it"
+        }
         Mode::Rules => "  / search   s state   c clear   Enter rule   1 alerts   3 sources",
         Mode::Sources => "  R reload   1 alerts   2 rules   Esc back",
         _ => "  Esc back",
@@ -1481,5 +1484,13 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         for (w, h) in [(1, 1), (5, 2), (20, 3)] {
             render(&a, w, h);
         }
+    }
+
+    #[test]
+    fn hint_changes_while_typing_a_search() {
+        let mut a = rules_app();
+        assert!(footer(&a, 100, 8).contains("/ search"));
+        key(&mut a, '/');
+        assert!(footer(&a, 100, 8).contains("Enter keeps it"));
     }
 }
