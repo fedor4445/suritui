@@ -10,6 +10,8 @@ use std::path::Path;
 pub struct Rule {
     pub sid: u64,
     pub rev: u32,
+    /// False when the rule is commented out (disabled) in the rules file.
+    pub enabled: bool,
     pub text: String,
 }
 
@@ -86,6 +88,7 @@ fn parse_line(line: &str) -> Option<Rule> {
     Some(Rule {
         sid,
         rev,
+        enabled: !text.starts_with('#'),
         text: text.to_string(),
     })
 }
@@ -137,6 +140,19 @@ impl RuleIndex {
 
     pub fn lookup(&self, sid: u64) -> Option<&Rule> {
         self.rules.get(&sid)
+    }
+
+    /// Every rule, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = &Rule> {
+        self.rules.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
     }
 }
 
@@ -448,6 +464,7 @@ mod tests {
         let rule = Rule {
             sid: 1,
             rev: 3,
+            enabled: true,
             text: String::new(),
         };
         assert_eq!(rev_warning(Some(3), &rule), None);
@@ -653,6 +670,7 @@ mod tests {
             labels: Default::default(),
             rules_dir: dir.clone(),
             et_version: "8.0.0".into(),
+            local: false,
         };
         // Port 1 on loopback: nothing listens there, no network is touched.
         let e = update_rules(&cfg, Some("http://127.0.0.1:1/x.tar.gz")).unwrap_err();

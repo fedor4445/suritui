@@ -14,10 +14,13 @@ pub struct Config {
     pub labels: HashMap<String, String>,
     pub rules_dir: PathBuf,
     pub et_version: String,
+    /// Running on the router itself: read the logs and rules directly (via sudo).
+    pub local: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
+    pub local: bool,
     pub router: Option<String>,
     pub user: Option<String>,
     pub rules_dir: Option<PathBuf>,
@@ -53,6 +56,8 @@ struct FileConfig {
     rules_dir: Option<PathBuf>,
     et_version: Option<String>,
     #[serde(default)]
+    local: bool,
+    #[serde(default)]
     labels: HashMap<String, String>,
 }
 
@@ -68,13 +73,19 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
             Err(e) => return Err(ConfigError::Parse(format!("{}: {e}", path.display()))),
         };
+        let local = o.local || file.local;
         let router = o
             .router
             .clone()
             .or(file.router)
-            .filter(|r| !r.trim().is_empty())
-            .ok_or(ConfigError::MissingRouter)?;
+            .filter(|r| !r.trim().is_empty());
+        let router = match (router, local) {
+            (Some(r), _) => r,
+            (None, true) => String::new(),
+            (None, false) => return Err(ConfigError::MissingRouter),
+        };
         Ok(Config {
+            local,
             router,
             user: o
                 .user
@@ -149,6 +160,7 @@ mod tests {
             user: Some("viewer".into()),
             rules_dir: Some(PathBuf::from("/x/rules")),
             config_path: None,
+            local: false,
         };
         let c = Config::load(&o, &h.0).unwrap();
         assert_eq!(c.router, "203.0.113.7");
@@ -189,5 +201,32 @@ mod tests {
             Config::load(&Overrides::default(), &h.0),
             Err(ConfigError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn local_mode_needs_no_router() {
+        let h = TempHome::new("local-flag");
+        let o = Overrides {
+            local: true,
+            ..Default::default()
+        };
+        let c = Config::load(&o, &h.0).unwrap();
+        assert!(c.local);
+        assert_eq!(c.router, "");
+    }
+
+    #[test]
+    fn local_mode_from_the_config_file() {
+        let h = TempHome::new("local-file");
+        h.write_config("local = true\n");
+        let c = Config::load(&Overrides::default(), &h.0).unwrap();
+        assert!(c.local);
+    }
+
+    #[test]
+    fn remote_mode_still_needs_a_router() {
+        let h = TempHome::new("remote-missing");
+        let e = Config::load(&Overrides::default(), &h.0).unwrap_err();
+        assert_eq!(e, ConfigError::MissingRouter);
     }
 }

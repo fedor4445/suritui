@@ -167,6 +167,7 @@ mod tests {
             labels: HashMap::new(),
             rules_dir: PathBuf::new(),
             et_version: "8.0.0".into(),
+            local: false,
         }
     }
 

@@ -12,7 +12,8 @@ use std::process::ExitCode;
 use suritui::config::{Config, ConfigError, Overrides};
 use suritui::model::App;
 use suritui::rules::{self, RuleIndex, RulesError};
-use suritui::source::SshSource;
+use suritui::local::{self, LocalSource};
+use suritui::source::{AlertSource, SshSource};
 use suritui::{input, ui};
 
 #[derive(Parser, Debug)]
@@ -51,6 +52,9 @@ struct Common {
     /// ssh user on the router
     #[arg(long, global = true, value_name = "NAME")]
     user: Option<String>,
+    /// Run on the router itself: read logs and rules directly (uses sudo)
+    #[arg(long, global = true)]
+    local: bool,
     /// Directory holding the local copy of the rules
     #[arg(long, global = true, value_name = "DIR")]
     rules_dir: Option<PathBuf>,
@@ -62,6 +66,7 @@ fn overrides(c: &Common) -> Overrides {
         user: c.user.clone(),
         rules_dir: c.rules_dir.clone(),
         config_path: c.config.clone(),
+        local: c.local,
     }
 }
 
@@ -112,16 +117,28 @@ fn restore_terminal() {
 }
 
 fn run_tui(cfg: Config) -> std::io::Result<()> {
-    let rules = match RuleIndex::from_dir(&cfg.rules_dir) {
-        Ok(i) => Some(i),
-        Err(RulesError::NotInstalled) => None,
-        Err(e) => {
-            eprintln!("suritui: warning: {e}");
-            None
-        }
+    let (rules, source): (Option<RuleIndex>, Box<dyn AlertSource>) = if cfg.local {
+        // The rules Suricata really loads, from every enabled source.
+        let rules = match local::load_rule_index() {
+            Ok(i) => Some(i),
+            Err(e) => {
+                eprintln!("suritui: warning: cannot read the loaded rules: {e}");
+                None
+            }
+        };
+        (rules, Box::new(LocalSource))
+    } else {
+        let rules = match RuleIndex::from_dir(&cfg.rules_dir) {
+            Ok(i) => Some(i),
+            Err(RulesError::NotInstalled) => None,
+            Err(e) => {
+                eprintln!("suritui: warning: {e}");
+                None
+            }
+        };
+        (rules, Box::new(SshSource::new(&cfg)))
     };
-    let source = SshSource::new(&cfg);
-    let mut app = App::new(cfg, Box::new(source), rules);
+    let mut app = App::new(cfg, source, rules);
 
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -209,9 +226,11 @@ mod tests {
             "u",
             "--rules-dir",
             "/d",
+            "--local",
         ])
         .unwrap();
         let o = overrides(&cli.common);
+        assert!(o.local);
         assert_eq!(o.router.as_deref(), Some("r"));
         assert_eq!(o.user.as_deref(), Some("u"));
         assert_eq!(o.rules_dir, Some(PathBuf::from("/d")));

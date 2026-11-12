@@ -57,6 +57,7 @@ pub fn app_with(days: Vec<(Range, Vec<Alert>)>, rules: Option<RuleIndex>) -> App
         labels: HashMap::from([("if0".to_string(), "wan".to_string())]),
         rules_dir: PathBuf::from("/nonexistent"),
         et_version: "7".to_string(),
+        local: false,
     };
     App::new(cfg, Box::new(Fake(days.into_iter().collect())), rules)
 }
