@@ -3,6 +3,7 @@
 //!   suritui-admin status
 //!   suritui-admin info
 //!   suritui-admin update
+//!   suritui-admin suppress|unsuppress SID by_src|by_dst IP
 //!   suritui-admin rules
 //!   suritui-admin alerts live | day K
 //!   suritui-admin disable SID
@@ -12,11 +13,12 @@
 
 use std::process::ExitCode;
 use suritui::admin::{apply, parse_sid, read_alerts, read_rules, status, Paths, ReadError, SystemRunner, Verb};
+use suritui::threshold::{apply_suppress, Track};
 use suritui::update::{apply_update, info};
 use suritui::source::Range;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: suritui-admin status | info | update | rules | alerts live | alerts day K | disable SID | enable SID");
+    eprintln!("usage: suritui-admin status | info | update | suppress|unsuppress SID by_src|by_dst IP | rules | alerts live | alerts day K | disable SID | enable SID");
     ExitCode::from(2)
 }
 
@@ -50,6 +52,13 @@ fn main() -> ExitCode {
         ["status"] => Ok(status(&paths, &runner)),
         ["info"] => Ok(info(&paths, &runner)),
         ["update"] => apply_update(&paths, &runner),
+        [verb @ ("suppress" | "unsuppress"), sid, track, ip] => {
+            let (Some(sid), Some(track)) = (parse_sid(sid), Track::parse(track)) else {
+                eprintln!("suritui-admin: not a valid sid or track (by_src | by_dst)");
+                return ExitCode::from(2);
+            };
+            apply_suppress(&paths, &runner, *verb == "suppress", sid, track, ip)
+        }
         [verb @ ("disable" | "enable"), sid] => {
             let Some(sid) = parse_sid(sid) else {
                 eprintln!("suritui-admin: not a valid sid");

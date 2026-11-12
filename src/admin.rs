@@ -274,6 +274,9 @@ impl Runner for SystemRunner {
 pub struct Paths {
     pub disable_conf: PathBuf,
     pub enable_conf: PathBuf,
+    pub threshold_conf: PathBuf,
+    pub suricata_yaml: PathBuf,
+    pub suricata_bin: String,
     pub rules: PathBuf,
     pub build_dir: PathBuf,
     pub backup_root: PathBuf,
@@ -292,6 +295,9 @@ impl Paths {
         Paths {
             disable_conf: "/usr/local/etc/suricata/disable.conf".into(),
             enable_conf: "/usr/local/etc/suricata/enable.conf".into(),
+            threshold_conf: "/usr/local/etc/suricata/threshold.config".into(),
+            suricata_yaml: "/usr/local/etc/suricata/suricata.yaml".into(),
+            suricata_bin: "/usr/local/bin/suricata".into(),
             rules: "/var/lib/suricata/rules/suricata.rules".into(),
             // Root-only parents: the suricata user must never be able to plant
             // a symlink that the root helper would write through.
@@ -982,6 +988,9 @@ mod tests {
         let p = Paths {
             disable_conf: d.join("disable.conf"),
             enable_conf: d.join("enable.conf"),
+            threshold_conf: d.join("threshold.config"),
+            suricata_yaml: d.join("suricata.yaml"),
+            suricata_bin: "sur".into(),
             rules: d.join("suricata.rules"),
             build_dir: d.join("build"),
             backup_root: d.join("backups"),

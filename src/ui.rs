@@ -84,15 +84,16 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::RuleInfo => draw_rule_info(f, app, body),
         Mode::Sources => draw_sources(f, app, body),
         Mode::Updates => draw_updates(f, app, body),
+        Mode::Thresholds => draw_thresholds(f, app, body),
         Mode::Confirm => draw_confirm(f, app, body),
         Mode::Working => draw_working(f, app, body),
         Mode::Done => draw_done(f, app, body),
     }
     let hint = match app.mode {
-        Mode::List => "  ? help   2 rules   3 sources   4 updates",
-        Mode::Detail if app.can_change() => "  Esc back   r rule text   w raw JSON   d disable this rule",
+        Mode::List => "  ? help   2 rules   3 sources   4 updates   5 suppress",
+        Mode::Detail if app.can_change() => "  Esc back   r rule   w raw   d disable rule   s silence src   S silence dest",
         Mode::Detail => "  Esc back   r rule text   w raw JSON",
-        Mode::Rule if app.can_change() => "  Esc back   d disable this rule",
+        Mode::Rule if app.can_change() => "  Esc back   d disable rule   s silence src   S silence dest",
         Mode::Rules if app.browser.as_ref().is_some_and(|b| b.editing) => {
             "  typing a search: Enter keeps it, Esc drops it"
         }
@@ -101,6 +102,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Sources => "  R reload   1 alerts   2 rules   Esc back",
         Mode::Updates if app.can_change() => "  U update now   R reload   1 alerts   2 rules   3 sources",
         Mode::Updates => "  R reload   1 alerts   2 rules   3 sources",
+        Mode::Thresholds => "  x remove   R reload   1 alerts   2 rules   4 updates",
         Mode::Confirm => "  y confirm   Esc cancel",
         Mode::Working => "  working: do not close this window",
         Mode::Done => "  Enter continue",
@@ -536,18 +538,29 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     let Some(p) = &app.pending else {
         return scroll_screen(f, app, area, "Confirm", vec![Line::from("Nothing to confirm.")]);
     };
-    let title = match p.action {
+    let title = match &p.action {
         Action::Rule(crate::admin::Verb::Disable, sid) => format!("Disable rule {sid}?"),
         Action::Rule(crate::admin::Verb::Enable, sid) => format!("Enable rule {sid}?"),
         Action::Update => "Update the rules now?".to_string(),
+        Action::Suppress { add: true, sid, track, ip } => format!(
+            "Silence rule {sid} for {} {ip}?",
+            if *track == crate::threshold::Track::BySrc { "source" } else { "destination" }
+        ),
+        Action::Suppress { add: false, sid, .. } => format!("Remove the suppress entry for rule {sid}?"),
     };
     let lines = vec![
         Line::from(Span::styled(title, Style::default().add_modifier(Modifier::BOLD))),
         plain(&p.msg),
         Line::default(),
-        Line::from(format!("This {}, rebuilds the rules and reloads Suricata live.", p.how)),
-        Line::from("The rebuild can take a couple of minutes. Suricata keeps watching with the old rules until the reload."),
-        Line::from("A backup is made first. If the check or the reload fails, the previous rules are put back."),
+        Line::from(match &p.action {
+            Action::Suppress { .. } => format!("This {}; Suricata checks the new file and reloads it live.", p.how),
+            _ => format!("This {}, rebuilds the rules and reloads Suricata live.", p.how),
+        }),
+        Line::from(match &p.action {
+            Action::Suppress { .. } => "It takes a few seconds.".to_string(),
+            _ => "The rebuild can take a couple of minutes. Suricata keeps watching with the old rules until the reload.".to_string(),
+        }),
+        Line::from("A backup is made first. If the check or the reload fails, the previous files are put back."),
         Line::default(),
         Line::from(Span::styled(
             "Press y to confirm, Esc to cancel.",
@@ -555,6 +568,36 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
         )),
     ];
     scroll_screen(f, app, area, "Confirm change", lines);
+}
+
+fn draw_thresholds(f: &mut Frame, app: &App, area: Rect) {
+    let w = area.width as usize;
+    let h = (area.height as usize).saturating_sub(1);
+    let mut lines = vec![Line::from(Span::styled(
+        fit(&format!("Suppress and threshold entries  {} in threshold.config", app.thresholds.len()), w),
+        header_style(),
+    ))];
+    if app.thresholds.is_empty() {
+        lines.push(Line::from("No entries. Open an alert and press s (source) or S (destination) to silence its rule for one host."));
+    } else {
+        let sel = app.thr_sel.min(app.thresholds.len() - 1);
+        let offset = if h == 0 || sel < h { 0 } else { sel + 1 - h };
+        for (i, e) in app.thresholds.iter().enumerate().skip(offset).take(h) {
+            let mut text = e.line.clone();
+            if e.removable.is_none() {
+                text.push_str("   (edit by hand)");
+            }
+            let style = if i == sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else if e.removable.is_none() {
+                Style::default().add_modifier(Modifier::DIM)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(fit(&text, w), style)));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_updates(f: &mut Frame, app: &App, area: Rect) {
@@ -568,9 +611,11 @@ fn draw_updates(f: &mut Frame, app: &App, area: Rect) {
 fn draw_working(f: &mut Frame, app: &App, area: Rect) {
     let (what, secs) = match &app.job {
         Some(j) => (
-            match j.action {
+            match &j.action {
                 Action::Rule(v, sid) => format!("{} rule {sid}", v.word()),
                 Action::Update => "updating the rules".to_string(),
+                Action::Suppress { add: true, sid, .. } => format!("silencing rule {sid}"),
+                Action::Suppress { add: false, sid, .. } => format!("removing the suppress entry of rule {sid}"),
             },
             j.started.elapsed().as_secs(),
         ),
@@ -668,6 +713,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("R", "refresh"),
         ("2 / 3 / 4 / 1", "rules / sources / updates / alerts"),
         ("U", "updates screen: update the rules now (router)"),
+        ("s / S", "alert screens: silence the rule for this source / destination"),
+        ("5, x", "suppress list; x removes the highlighted entry"),
         ("d / e", "disable / enable a rule: rules list, rule screen; d on an alert (router)"),
         ("y", "confirm a change (Esc cancels)"),
         ("/ s c", "rules: search / state filter / clear"),
@@ -1848,7 +1895,7 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         a.set_admin(fake(Ok(vec!["done".into()]), AFTER_DISABLED));
         press(&mut a, KeyCode::Enter);
         assert_eq!(a.mode, Mode::Detail);
-        assert!(footer(&a, 120, 12).contains("d disable this rule"));
+        assert!(footer(&a, 120, 12).contains("d disable rule"));
         key(&mut a, 'd');
         assert_eq!(a.mode, Mode::Confirm);
         assert!(screen(&a, 120, 12).contains("Disable rule 2000001?"));
@@ -1968,5 +2015,144 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         a.mode = Mode::Help;
         let s = screen(&a, 100, 40);
         assert!(s.contains("updates") && s.contains("update the rules now"), "{s}");
+    }
+
+    // ---- suppress entries ----
+
+    use crate::threshold::{parse_entries, ThresholdEntry, Track};
+
+    struct FakeThr {
+        entries: std::sync::Mutex<Vec<ThresholdEntry>>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Admin for FakeThr {
+        fn available(&self) -> bool {
+            true
+        }
+        fn change(&self, _v: Verb, _sid: u64) -> Result<Vec<String>, String> {
+            Ok(vec![])
+        }
+        fn suppress(&self, add: bool, sid: u64, track: Track, ip: &str) -> Result<Vec<String>, String> {
+            self.calls.lock().unwrap().push(format!("{add} {sid} {} {ip}", track.word()));
+            let line = crate::threshold::suppress_line(sid, track, ip);
+            let mut e = self.entries.lock().unwrap();
+            if add {
+                e.extend(parse_entries(&line));
+            } else {
+                e.retain(|x| x.line != line);
+            }
+            Ok(vec![format!("done {add}")])
+        }
+        fn thresholds(&self) -> Vec<ThresholdEntry> {
+            self.entries.lock().unwrap().clone()
+        }
+        fn reload(&self) -> Result<(RuleIndex, DisableConf), String> {
+            Ok((RuleIndex::from_text(RULES), DisableConf::default()))
+        }
+    }
+
+    fn thr_app(entries: &str) -> (App, Arc<FakeThr>) {
+        let mut al = alert("2026-11-10T10:11:12.000000+0000", "ET SCAN nmap probe", "allowed", None);
+        al.raw = r#"{"event_type":"alert","src_ip":"192.0.2.5","dest_ip":"198.51.100.7"}"#.to_string();
+        let mut a = app_with(
+            vec![(Range::Today, vec![al])],
+            Some(crate::rules::RuleIndex::from_text(RULES)),
+        );
+        let f = Arc::new(FakeThr {
+            entries: std::sync::Mutex::new(parse_entries(entries)),
+            calls: std::sync::Mutex::new(vec![]),
+        });
+        a.set_admin(f.clone());
+        (a, f)
+    }
+
+    #[test]
+    fn s_on_an_alert_silences_the_rule_for_its_source() {
+        let (mut a, f) = thr_app("");
+        press(&mut a, KeyCode::Enter);
+        assert!(footer(&a, 140, 12).contains("s silence src"));
+        key(&mut a, 's');
+        assert_eq!(a.mode, Mode::Confirm);
+        let s = screen(&a, 140, 14);
+        assert!(s.contains("Silence rule 2000001 for source 192.0.2.5?") && s.contains("stays active for"), "{s}");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::Detail);
+        key(&mut a, 'S');
+        assert!(screen(&a, 140, 14).contains("for destination 198.51.100.7?"));
+        key(&mut a, 'y');
+        wait_done(&mut a);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::List);
+        assert_eq!(f.calls.lock().unwrap().as_slice(), ["true 2000001 by_dst 198.51.100.7"]);
+    }
+
+    #[test]
+    fn alerts_without_an_address_or_helper_explain_themselves() {
+        let (mut a, _f) = thr_app("");
+        a.set_mode(Mode::List);
+        // an alert whose raw JSON has no addresses
+        let mut b = app_with(
+            vec![(Range::Today, vec![alert("2026-11-10T10:11:12.000000+0000", "ET SCAN x", "allowed", None)])],
+            Some(crate::rules::RuleIndex::from_text(RULES)),
+        );
+        b.set_admin(Arc::new(FakeThr { entries: Default::default(), calls: Default::default() }));
+        press(&mut b, KeyCode::Enter);
+        key(&mut b, 's');
+        assert_eq!(b.mode, Mode::Detail);
+        assert!(b.status.contains("no usable address"), "{}", b.status);
+        let mut c = app(vec![alert("2026-11-10T10:11:12.000000+0000", "ET SCAN x", "allowed", None)]);
+        press(&mut c, KeyCode::Enter);
+        key(&mut c, 's');
+        assert_eq!(c.mode, Mode::Detail);
+    }
+
+    #[test]
+    fn the_suppress_list_shows_entries_and_removes_only_ours() {
+        let (mut a, f) = thr_app(
+            "suppress gen_id 1, sig_id 2000001, track by_src, ip 192.0.2.5\nthreshold gen_id 1, sig_id 8, type limit, track by_src, count 1, seconds 60\n",
+        );
+        key(&mut a, '5');
+        assert_eq!(a.mode, Mode::Thresholds);
+        let s = screen(&a, 120, 10);
+        assert!(s.contains("2 in threshold.config") && s.contains("sig_id 2000001") && s.contains("(edit by hand)"), "{s}");
+        key(&mut a, 'j');
+        key(&mut a, 'x'); // the hand-written threshold line
+        assert_eq!(a.mode, Mode::Thresholds);
+        assert!(a.status.contains("by hand"), "{}", a.status);
+        key(&mut a, 'k');
+        key(&mut a, 'x');
+        assert_eq!(a.mode, Mode::Confirm);
+        assert!(screen(&a, 140, 12).contains("Remove the suppress entry for rule 2000001?"));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::Thresholds);
+        key(&mut a, 'x');
+        key(&mut a, 'y');
+        wait_done(&mut a);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Thresholds, "back on the list, which is read again");
+        assert!(!screen(&a, 120, 10).contains("sig_id 2000001"));
+        assert_eq!(f.calls.lock().unwrap().as_slice(), ["false 2000001 by_src 192.0.2.5"]);
+    }
+
+    #[test]
+    fn five_needs_local_mode_and_empty_list_explains() {
+        let mut a = app(vec![]);
+        key(&mut a, '5');
+        assert_eq!(a.mode, Mode::List);
+        assert!(a.status.contains("--local"), "{}", a.status);
+        let (mut a, _f) = thr_app("");
+        key(&mut a, '5');
+        assert!(screen(&a, 140, 8).contains("No entries"));
+        key(&mut a, '1');
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn help_lists_the_suppress_keys() {
+        let mut a = sample();
+        a.mode = Mode::Help;
+        let s = screen(&a, 110, 44);
+        assert!(s.contains("silence the rule") && s.contains("suppress list"), "{s}");
     }
 }

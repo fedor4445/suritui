@@ -3,6 +3,7 @@
 //! this module only builds that one fixed command line.
 
 use crate::admin::Verb;
+use crate::threshold::{ThresholdEntry, Track};
 use crate::local::{self, DisableConf};
 use crate::rules::RuleIndex;
 use std::process::Command;
@@ -12,9 +13,11 @@ use std::time::Instant;
 pub use crate::local::HELPER;
 
 /// What can be started from the TUI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Rule(Verb, u64),
+    /// Add (`add`) or remove a suppress entry for one host.
+    Suppress { add: bool, sid: u64, track: Track, ip: String },
     /// Download and install the newest rules now.
     Update,
 }
@@ -43,10 +46,19 @@ pub trait Admin: Send + Sync {
     fn info(&self) -> Result<Vec<String>, String> {
         Err("no status is available here".to_string())
     }
-    fn run(&self, a: Action) -> Result<Vec<String>, String> {
+    /// Add or remove a suppress entry.
+    fn suppress(&self, _add: bool, _sid: u64, _track: Track, _ip: &str) -> Result<Vec<String>, String> {
+        Err("suppressing is not available here".to_string())
+    }
+    /// The entries of threshold.config.
+    fn thresholds(&self) -> Vec<ThresholdEntry> {
+        Vec::new()
+    }
+    fn run(&self, a: &Action) -> Result<Vec<String>, String> {
         match a {
-            Action::Rule(v, sid) => self.change(v, sid),
+            Action::Rule(v, sid) => self.change(*v, *sid),
             Action::Update => self.update(),
+            Action::Suppress { add, sid, track, ip } => self.suppress(*add, *sid, *track, ip),
         }
     }
     /// Read the rules again after a change.
@@ -92,6 +104,16 @@ impl Admin for LocalAdmin {
 
     fn info(&self) -> Result<Vec<String>, String> {
         run_helper(&["info"])
+    }
+
+    fn suppress(&self, add: bool, sid: u64, track: Track, ip: &str) -> Result<Vec<String>, String> {
+        run_helper(&[if add { "suppress" } else { "unsuppress" }, &sid.to_string(), track.word(), ip])
+    }
+
+    fn thresholds(&self) -> Vec<ThresholdEntry> {
+        std::fs::read_to_string(crate::local::THRESHOLD_CONF)
+            .map(|t| crate::threshold::parse_entries(&t))
+            .unwrap_or_default()
     }
 
     fn reload(&self) -> Result<(RuleIndex, DisableConf), String> {

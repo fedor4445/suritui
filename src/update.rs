@@ -354,6 +354,9 @@ mod tests {
         let p = Paths {
             disable_conf: d.join("disable.conf"),
             enable_conf: d.join("enable.conf"),
+            threshold_conf: d.join("threshold.config"),
+            suricata_yaml: d.join("suricata.yaml"),
+            suricata_bin: "sur".into(),
             rules: d.join("suricata.rules"),
             build_dir: d.join("build"),
             backup_root: d.join("backups"),

@@ -5,6 +5,7 @@ use crate::alert::{category, is_informational, Alert};
 use crate::browser::{self, RulesBrowser, SourcesView};
 use crate::admin::Verb;
 use crate::change::{Action, Admin, Job, Outcome, Pending};
+use crate::threshold::{ThresholdEntry, Track};
 use crate::config::Config;
 use crate::local::{self, DisableConf};
 use crate::rules::{rev_warning, RuleIndex};
@@ -35,6 +36,8 @@ pub enum Mode {
     Working,
     /// Suricata health and rule updates.
     Updates,
+    /// Suppress entries (threshold.config).
+    Thresholds,
     /// The helper has finished.
     Done,
 }
@@ -98,6 +101,8 @@ pub struct App {
     pub job: Option<Job>,
     pub outcome: Option<(bool, Vec<String>)>,
     pub updates: Option<Vec<String>>,
+    pub thresholds: Vec<ThresholdEntry>,
+    pub thr_sel: usize,
     after_done: Mode,
     cache: HashMap<Range, Loaded>,
     pub mode: Mode,
@@ -138,6 +143,8 @@ impl App {
             job: None,
             outcome: None,
             updates: None,
+            thresholds: Vec::new(),
+            thr_sel: 0,
             after_done: Mode::Rules,
             cache: HashMap::new(),
             mode: Mode::List,
@@ -395,13 +402,15 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let action = p.action;
         // Back to where the change started: the alert list for an alert's rule.
-        self.after_done = match (action, p.from) {
+        self.after_done = match (&action, p.from) {
             (Action::Update, _) => Mode::Updates,
+            (Action::Suppress { .. }, Mode::Thresholds) => Mode::Thresholds,
             (_, Mode::Detail | Mode::Rule) => Mode::List,
             _ => Mode::Rules,
         };
+        let job_action = action.clone();
         std::thread::spawn(move || {
-            let out = match admin.run(action) {
+            let out = match admin.run(&action) {
                 Ok(lines) => match admin.reload() {
                     Ok(fresh) => Outcome { ok: true, lines, fresh: Some(fresh) },
                     Err(e) => {
@@ -417,7 +426,7 @@ impl App {
         self.job = Some(Job {
             rx,
             started: std::time::Instant::now(),
-            action,
+            action: job_action,
         });
         self.set_mode(Mode::Working);
     }
@@ -453,6 +462,9 @@ impl App {
         if self.after_done == Mode::Updates {
             self.load_updates();
         }
+        if self.after_done == Mode::Thresholds {
+            self.load_thresholds();
+        }
         self.set_mode(self.after_done);
     }
 
@@ -472,6 +484,89 @@ impl App {
     pub fn load_updates(&mut self) {
         let Some(admin) = &self.admin else { return };
         self.updates = Some(admin.info().unwrap_or_else(|e| vec![format!("Could not read the status: {e}")]));
+    }
+
+    /// Open the suppress list (router only).
+    pub fn open_thresholds(&mut self) {
+        if self.admin.is_none() {
+            self.status = "suppress entries are only available on the router (use --local)".to_string();
+            return;
+        }
+        self.load_thresholds();
+        self.status.clear();
+        self.set_mode(Mode::Thresholds);
+    }
+
+    pub fn load_thresholds(&mut self) {
+        if let Some(a) = &self.admin {
+            self.thresholds = a.thresholds();
+        }
+        self.thr_sel = self.thr_sel.min(self.thresholds.len().saturating_sub(1));
+    }
+
+    pub fn move_threshold(&mut self, delta: i32) {
+        let n = self.thresholds.len();
+        if n == 0 {
+            self.thr_sel = 0;
+            return;
+        }
+        self.thr_sel = (self.thr_sel as i64 + delta as i64).clamp(0, n as i64 - 1) as usize;
+    }
+
+    /// `s` / `S` on an alert: silence its rule for the alert's source / destination.
+    pub fn request_suppress_for_alert(&mut self, track: Track) {
+        let Some(a) = self.selected() else { return };
+        let Some(sid) = a.sid else {
+            self.status = "this alert has no rule id".to_string();
+            return;
+        };
+        let key = if track == Track::BySrc { "src_ip" } else { "dest_ip" };
+        let host = serde_json::from_str::<serde_json::Value>(&a.raw)
+            .ok()
+            .and_then(|v| v.get(key).and_then(|x| x.as_str().map(str::to_string)));
+        let Some(host) = host.and_then(|h| crate::threshold::parse_ip_spec(&h)) else {
+            self.status = "this alert has no usable address".to_string();
+            return;
+        };
+        let msg = a.signature.clone();
+        let Some(admin) = &self.admin else {
+            self.status = "suppressing works only on the router (--local)".to_string();
+            return;
+        };
+        if !admin.available() {
+            self.status = "the helper suritui-admin is not installed here".to_string();
+            return;
+        }
+        let who = if track == Track::BySrc { "source" } else { "destination" };
+        self.status.clear();
+        self.pending = Some(Pending {
+            action: Action::Suppress { add: true, sid, track, ip: host.clone() },
+            msg,
+            how: format!(
+                "adds a suppress entry to threshold.config: alerts of this rule are ignored when the {who} is {host}; \
+                 the rule stays active for every other host"
+            ),
+            from: self.mode,
+        });
+        self.set_mode(Mode::Confirm);
+    }
+
+    /// `x` on the suppress list: remove the highlighted entry (only ours).
+    pub fn request_unsuppress(&mut self) {
+        let Some(e) = self.thresholds.get(self.thr_sel) else { return };
+        let Some((sid, track, ip)) = e.removable.clone() else {
+            self.status = "this entry was not made by suritui; edit threshold.config by hand".to_string();
+            return;
+        };
+        self.status.clear();
+        self.pending = Some(Pending {
+            action: Action::Suppress { add: false, sid, track, ip: ip.clone() },
+            msg: e.line.clone(),
+            how: "removes this suppress entry from threshold.config, so the rule alerts for this host again"
+                .to_string(),
+            from: self.mode,
+        });
+        self.set_mode(Mode::Confirm);
     }
 
     /// `U` on the Updates screen: ask first.
@@ -711,6 +806,9 @@ impl App {
         }
         if self.mode == Mode::Updates {
             return "updates and status".to_string();
+        }
+        if self.mode == Mode::Thresholds {
+            return format!("{} entries", self.thresholds.len());
         }
         let shown = self.visible().len();
         let hidden = self.hidden_count();

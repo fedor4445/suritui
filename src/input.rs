@@ -1,6 +1,7 @@
 //! Key handling: maps key events onto model transitions.
 
 use crate::admin::Verb;
+use crate::threshold::Track;
 use crate::model::{App, Mode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -53,7 +54,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (Mode::List, KeyCode::Char('?')) => app.set_mode(Mode::Help),
         (Mode::List, KeyCode::Char('2')) => app.open_rules(),
         (Mode::List, KeyCode::Char('3')) => app.open_sources(),
-        (Mode::List | Mode::Rules | Mode::Sources, KeyCode::Char('4')) => app.open_updates(),
+        (Mode::List | Mode::Rules | Mode::Sources | Mode::Updates, KeyCode::Char('4')) => app.open_updates(),
+        (Mode::List | Mode::Rules | Mode::Sources | Mode::Updates, KeyCode::Char('5')) => app.open_thresholds(),
+        (Mode::Thresholds, KeyCode::Char('1')) => app.set_mode(Mode::List),
+        (Mode::Thresholds, KeyCode::Char('2')) => app.open_rules(),
+        (Mode::Thresholds, KeyCode::Char('4')) => app.open_updates(),
+        (Mode::Thresholds, KeyCode::Char('j') | KeyCode::Down) => app.move_threshold(1),
+        (Mode::Thresholds, KeyCode::Char('k') | KeyCode::Up) => app.move_threshold(-1),
+        (Mode::Thresholds, KeyCode::Char('x')) => app.request_unsuppress(),
+        (Mode::Thresholds, KeyCode::Char('R')) => app.load_thresholds(),
+        (Mode::Detail | Mode::Rule, KeyCode::Char('s')) => app.request_suppress_for_alert(Track::BySrc),
+        (Mode::Detail | Mode::Rule, KeyCode::Char('S')) => app.request_suppress_for_alert(Track::ByDst),
         (Mode::Updates, KeyCode::Char('1')) => app.set_mode(Mode::List),
         (Mode::Updates, KeyCode::Char('2')) => app.open_rules(),
         (Mode::Updates, KeyCode::Char('3')) => app.open_sources(),
@@ -78,7 +89,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (m, KeyCode::Char('G') | KeyCode::End) if m.scrolls() => app.scroll_to_bottom(),
         (Mode::Detail, KeyCode::Char('r')) => app.set_mode(Mode::Rule),
         (Mode::Detail, KeyCode::Char('w')) => app.set_mode(Mode::Raw),
-        (Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help | Mode::Sources | Mode::Updates, KeyCode::Esc) => {
+        (Mode::Detail | Mode::Rule | Mode::Raw | Mode::Help | Mode::Sources | Mode::Updates | Mode::Thresholds, KeyCode::Esc) => {
             app.set_mode(Mode::List)
         }
         (Mode::RuleInfo, KeyCode::Esc) => app.set_mode(Mode::Rules),
