@@ -32,7 +32,14 @@ fn main() -> ExitCode {
     // (3 = no log for that day), so they are handled before the change verbs.
     let read = match words.as_slice() {
         ["rules"] => Some(read_rules(&paths, &mut std::io::stdout().lock())),
-        ["log", name] => Some(read_log(&paths, name, &mut std::io::stdout().lock())),
+        ["log", name] => Some(match read_log(&paths, name, &mut std::io::stdout().lock()) {
+            // A log that has not been written yet is not an error for the screen.
+            Err(ReadError::NoSuchDay) => {
+                println!("(this log file does not exist yet)");
+                Ok(())
+            }
+            other => other,
+        }),
         ["alerts", "live"] => Some(read_alerts(&paths, Range::Today, &mut std::io::stdout().lock())),
         ["alerts", "day", k] if k.len() <= 2 && k.bytes().all(|b| b.is_ascii_digit()) => {
             let k: u8 = k.parse().unwrap_or(255);
