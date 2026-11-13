@@ -64,7 +64,7 @@ fn update_log_summary(path: &Path) -> Vec<String> {
     if !m.file_type().is_file() {
         return vec![];
     }
-    let Ok(text) = fs::read_to_string(path) else { return vec![] };
+    let Ok(text) = crate::admin::read_regular(path) else { return vec![] };
     let keep = |l: &str| {
         ["===", "Loaded", "Enabled", "Disabled", "Writing", "reload", "FAILED", "Error", "error"]
             .iter()
@@ -103,7 +103,7 @@ pub fn info(paths: &Paths, runner: &dyn Runner) -> Report {
         }
         None => say(&mut r, "Loaded in memory: unknown (Suricata did not answer)"),
     }
-    match fs::read_to_string(&paths.rules) {
+    match crate::admin::read_regular(&paths.rules) {
         Ok(t) => {
             let m = rule_map(&t);
             let off = m.values().filter(|(e, _)| !*e).count();
@@ -124,7 +124,7 @@ pub fn info(paths: &Paths, runner: &dyn Runner) -> Report {
         None => say(&mut r, "Rule download: none cached"),
     }
     let count = |p: &Path| {
-        fs::read_to_string(p)
+        crate::admin::read_regular(p)
             .map(|t| t.lines().filter(|l| crate::admin::line_sid(l).is_some()).count())
             .unwrap_or(0)
     };
@@ -196,7 +196,7 @@ fn run_update_build(paths: &Paths, runner: &dyn Runner) -> Result<(String, Vec<S
         return Err(format!("the update failed (exit {:?}): {}", o.code, tail.join(" | ")));
     }
     let failed = failed_fetches(&o);
-    let text = fs::read_to_string(paths.build_dir.join("suricata.rules")).map_err(|e| io("the update produced no rules file", e))?;
+    let text = crate::admin::read_regular(paths.build_dir.join("suricata.rules")).map_err(|e| io("the update produced no rules file", e))?;
     Ok((text, failed))
 }
 
@@ -230,10 +230,10 @@ pub fn apply_update(paths: &Paths, runner: &dyn Runner) -> Result<Report, String
 pub(crate) fn update_locked(paths: &Paths, runner: &dyn Runner, strict: bool) -> Result<Report, String> {
     let mut rep = Report::default();
     let rules_meta = plain_file(&paths.rules)?;
-    let live_rules = fs::read_to_string(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
+    let live_rules = crate::admin::read_regular(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
     let class_path = paths.rules.with_file_name("classification.config");
     let live_class = match plain_file(&class_path) {
-        Ok(m) => Some((m, fs::read_to_string(&class_path).map_err(|e| io("cannot read classification.config", e))?)),
+        Ok(m) => Some((m, crate::admin::read_regular(&class_path).map_err(|e| io("cannot read classification.config", e))?)),
         Err(_) => None,
     };
 
@@ -254,7 +254,7 @@ pub(crate) fn update_locked(paths: &Paths, runner: &dyn Runner, strict: bool) ->
     for f in &failed {
         say(&mut rep, format!("warning: {f}"));
     }
-    let cand_class = fs::read_to_string(paths.build_dir.join("classification.config")).ok();
+    let cand_class = crate::admin::read_regular(paths.build_dir.join("classification.config")).ok();
     cleanup();
 
     let (l, c) = (rule_map(&live_rules), rule_map(&cand_rules));
@@ -282,10 +282,10 @@ pub(crate) fn update_locked(paths: &Paths, runner: &dyn Runner, strict: bool) ->
     let backup = paths.backup_root.join(&stamp_s);
     fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
     let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
-    fs::copy(&paths.rules, backup.join("suricata.rules")).map_err(|e| io("backup of the rules", e))?;
+    crate::admin::copy_regular(&paths.rules, backup.join("suricata.rules")).map_err(|e| io("backup of the rules", e))?;
     for f in [&paths.disable_conf, &paths.enable_conf, &class_path] {
         if f.is_file() {
-            let _ = fs::copy(f, backup.join(f.file_name().unwrap_or_default()));
+            let _ = crate::admin::copy_regular(f, backup.join(f.file_name().unwrap_or_default()));
         }
     }
     say(&mut rep, format!("backup: {}", backup.display()));

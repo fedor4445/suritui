@@ -157,7 +157,7 @@ pub fn apply_suppress(
             return Err("a rule update is running right now; try again after it finishes".into());
         }
     }
-    let live = fs::read_to_string(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
+    let live = crate::admin::read_regular(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
     if !rule_map(&live).contains_key(&sid) {
         return Err(format!("sid {sid} is not in the live rules"));
     }
@@ -165,7 +165,7 @@ pub fn apply_suppress(
     let exists = paths.threshold_conf.exists() || fs::symlink_metadata(&paths.threshold_conf).is_ok();
     let meta = if exists { plain_file(&paths.threshold_conf)? } else { plain_file(&paths.disable_conf)? };
     let old = if exists {
-        fs::read_to_string(&paths.threshold_conf).map_err(|e| io("cannot read threshold.config", e))?
+        crate::admin::read_regular(&paths.threshold_conf).map_err(|e| io("cannot read threshold.config", e))?
     } else {
         String::new()
     };
@@ -198,7 +198,7 @@ pub fn apply_suppress(
     fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
     let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
     if exists {
-        fs::copy(&paths.threshold_conf, backup.join("threshold.config")).map_err(|e| io("backup of threshold.config", e))?;
+        crate::admin::copy_regular(&paths.threshold_conf, backup.join("threshold.config")).map_err(|e| io("backup of threshold.config", e))?;
     }
     say(&mut rep, format!("backup: {}", backup.display()));
     let swaps = [Swap {

@@ -340,7 +340,7 @@ impl Lock {
                     return Ok(Lock(path.to_path_buf()));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                    let pid = fs::read_to_string(path).unwrap_or_default();
+                    let pid = read_regular(path).unwrap_or_default();
                     let pid = pid.trim();
                     let alive = parse_sid(pid).is_some_and(|p| {
                         runner
@@ -399,6 +399,56 @@ pub(crate) fn put(path: &Path, data: &[u8], like: &fs::Metadata) -> Result<(), S
         let _ = fs::remove_file(&stage);
         io("rename into place", e)
     })
+}
+
+/// Open a file for reading the safe way for a directory another user can write
+/// to. A separate "is it a symlink?" check followed by an open leaves a gap in
+/// which the file can be swapped for a link to something only root may read.
+/// So: O_NOFOLLOW (a link is refused by the open itself), O_NONBLOCK (a fifo
+/// planted there cannot hang the helper), then a check on the open file that it
+/// is a regular file.
+pub(crate) fn open_regular(path: impl AsRef<Path>) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = path.as_ref();
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !f.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other(format!("{} is not a regular file; refusing", path.display())));
+    }
+    Ok(f)
+}
+
+/// `fs::read_to_string` for such a file.
+pub(crate) fn read_regular(path: impl AsRef<Path>) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut s = String::new();
+    open_regular(path)?.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+/// `fs::read` for such a file.
+pub(crate) fn read_regular_bytes(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut b = Vec::new();
+    open_regular(path)?.read_to_end(&mut b)?;
+    Ok(b)
+}
+
+/// `fs::copy` for such a source (into a new file under a root-only backup directory).
+pub(crate) fn copy_regular(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
+    let mut from = open_regular(src)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Same-second reruns reuse the backup name, as `fs::copy` always allowed; a link is never followed.
+    let mut to = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dst.as_ref())?;
+    std::io::copy(&mut from, &mut to)?;
+    to.sync_all()
 }
 
 /// A live file must be a plain file, not a symlink or anything else.
@@ -610,7 +660,7 @@ fn rebuild(paths: &Paths, runner: &dyn Runner, cand: &Candidate) -> Result<Strin
         let tail: Vec<&str> = o.stdout.lines().chain(o.stderr.lines()).rev().take(3).collect();
         return Err(format!("the rebuild failed (exit {:?}): {}", o.code, tail.join(" | ")));
     }
-    fs::read_to_string(paths.build_dir.join("suricata.rules")).map_err(|e| io("the rebuild produced no rules file", e))
+    read_regular(paths.build_dir.join("suricata.rules")).map_err(|e| io("the rebuild produced no rules file", e))
 }
 
 /// Disable or enable one rule. Nothing changes unless every check passes; if the
@@ -634,13 +684,13 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
     let dc_meta = plain_file(&paths.disable_conf)?;
     let ec_exists = paths.enable_conf.exists() || fs::symlink_metadata(&paths.enable_conf).is_ok();
     let ec_meta = if ec_exists { plain_file(&paths.enable_conf)? } else { dc_meta.clone() };
-    let live_rules = fs::read_to_string(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
+    let live_rules = read_regular(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
     if !rule_map(&live_rules).contains_key(&sid) {
         return Err(format!("sid {sid} is not in the live rules"));
     }
-    let dc_text = fs::read_to_string(&paths.disable_conf).map_err(|e| io("cannot read disable.conf", e))?;
+    let dc_text = read_regular(&paths.disable_conf).map_err(|e| io("cannot read disable.conf", e))?;
     let ec_text = if ec_exists {
-        fs::read_to_string(&paths.enable_conf).map_err(|e| io("cannot read enable.conf", e))?
+        read_regular(&paths.enable_conf).map_err(|e| io("cannot read enable.conf", e))?
     } else {
         String::new()
     };
@@ -689,11 +739,11 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
     let backup = paths.backup_root.join(&stamp);
     fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
     let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
-    fs::copy(&paths.disable_conf, backup.join("disable.conf")).map_err(|e| io("backup of disable.conf", e))?;
+    copy_regular(&paths.disable_conf, backup.join("disable.conf")).map_err(|e| io("backup of disable.conf", e))?;
     if ec_exists {
-        fs::copy(&paths.enable_conf, backup.join("enable.conf")).map_err(|e| io("backup of enable.conf", e))?;
+        copy_regular(&paths.enable_conf, backup.join("enable.conf")).map_err(|e| io("backup of enable.conf", e))?;
     }
-    fs::copy(&paths.rules, backup.join("suricata.rules")).map_err(|e| io("backup of the rules", e))?;
+    copy_regular(&paths.rules, backup.join("suricata.rules")).map_err(|e| io("backup of the rules", e))?;
     say(&mut rep, format!("backup: {}", backup.display()));
 
     // 4./5. install the new files and reload; everything is undone from the
@@ -751,7 +801,8 @@ fn open_plain(path: &Path) -> Result<fs::File, ReadError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ReadError::NoSuchDay),
         Err(e) => return Err(ReadError::Other(io("cannot stat the log", e))),
     }
-    fs::File::open(path).map_err(|e| ReadError::Other(io("cannot open", e)))
+    // The check above only picks the error message; the open itself is what refuses links.
+    open_regular(path).map_err(|e| ReadError::Other(io("cannot open", e)))
 }
 
 const ALERT_MARK: &[u8] = b"\"event_type\":\"alert\"";
@@ -844,7 +895,7 @@ pub fn read_rules<W: std::io::Write>(paths: &Paths, w: &mut W) -> Result<(), Rea
 pub fn status(paths: &Paths, runner: &dyn Runner) -> Report {
     let mut rep = Report::default();
     say(&mut rep, format!("suricata running: {}", if suricata_running(runner) { "yes" } else { "no" }));
-    match fs::read_to_string(&paths.rules) {
+    match read_regular(&paths.rules) {
         Ok(t) => {
             let m = rule_map(&t);
             let off = m.values().filter(|(e, _)| !*e).count();
@@ -852,11 +903,11 @@ pub fn status(paths: &Paths, runner: &dyn Runner) -> Report {
         }
         Err(e) => say(&mut rep, format!("rules: cannot read ({e})")),
     }
-    let n = fs::read_to_string(&paths.disable_conf)
+    let n = read_regular(&paths.disable_conf)
         .map(|t| t.lines().filter(|l| line_sid(l).is_some()).count())
         .unwrap_or(0);
     say(&mut rep, format!("disable.conf: {n} sids"));
-    let e = fs::read_to_string(&paths.enable_conf)
+    let e = read_regular(&paths.enable_conf)
         .map(|t| t.lines().filter(|l| line_sid(l).is_some()).count())
         .unwrap_or(0);
     say(&mut rep, format!("enable.conf: {e} sids"));
@@ -1547,5 +1598,34 @@ mod tests {
     fn a_closed_output_is_not_an_error() {
         let (_t, p) = setup("closed-pipe", &rules(&[R_ON]), "");
         assert!(matches!(read_rules(&p, &mut ClosedPipe), Err(ReadError::OutputClosed)));
+    }
+
+    #[test]
+    fn open_regular_refuses_links_and_fifos_in_the_open_itself() {
+        let t = std::env::temp_dir().join(format!("suritui-openreg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&t);
+        fs::create_dir_all(&t).unwrap();
+        let real = t.join("real");
+        fs::write(&real, "hello\n").unwrap();
+        assert_eq!(read_regular(&real).unwrap(), "hello\n");
+        assert_eq!(read_regular_bytes(&real).unwrap(), b"hello\n");
+        // a link to a perfectly good file: refused by O_NOFOLLOW, not by a separate check
+        let link = t.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_regular(&link).is_err());
+        assert!(copy_regular(&link, t.join("copy")).is_err());
+        // a fifo must neither hang nor be read
+        let fifo = t.join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let e = read_regular(&fifo).unwrap_err();
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+        // a directory is refused too
+        assert!(read_regular(&t).is_err());
+        // copying a regular file works and may be repeated
+        copy_regular(&real, t.join("copy")).unwrap();
+        copy_regular(&real, t.join("copy")).unwrap();
+        assert_eq!(fs::read_to_string(t.join("copy")).unwrap(), "hello\n");
+        let _ = fs::remove_dir_all(&t);
     }
 }

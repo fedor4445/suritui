@@ -59,7 +59,7 @@ pub fn secrets(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let Ok(rd) = fs::read_dir(dir) else { return out };
     for e in rd.flatten() {
-        let Ok(text) = fs::read_to_string(e.path()) else { continue };
+        let Ok(text) = crate::admin::read_regular(e.path()) else { continue };
         let mut in_params = false;
         for line in text.lines() {
             if let Some(url) = line.strip_prefix("url:") {
@@ -149,7 +149,7 @@ fn snapshot(dir: &Path) -> Result<Vec<Saved>, String> {
         if !m.file_type().is_file() {
             continue;
         }
-        let data = fs::read(e.path()).map_err(|e| format!("cannot read a source file: {e}"))?;
+        let data = crate::admin::read_regular_bytes(e.path()).map_err(|e| format!("cannot read a source file: {e}"))?;
         v.push(Saved { name: e.file_name().to_string_lossy().into_owned(), data, mode: m.mode() & 0o7777, uid: m.uid(), gid: m.gid() });
     }
     Ok(v)
@@ -303,7 +303,7 @@ fn remove_source_file(paths: &Paths, name: &str) -> Result<(), String> {
     if !m.file_type().is_file() {
         return Err(format!("the source file for {name} is not a plain file"));
     }
-    let text = fs::read_to_string(&f).map_err(|e| format!("cannot read the source file: {e}"))?;
+    let text = crate::admin::read_regular(&f).map_err(|e| format!("cannot read the source file: {e}"))?;
     if !text.lines().any(|l| l.trim() == format!("source: {name}")) {
         return Err(format!("the source file for {name} does not say it is {name}; refusing to remove it"));
     }
