@@ -192,6 +192,31 @@ fn row_style(a: &Alert) -> Style {
     }
 }
 
+/// Colors for signatures. Red (danger), yellow (major severity) and blue
+/// (headers) are taken by other meanings, so they are not used here.
+const RULE_COLORS: [Color; 6] = [
+    Color::Green,
+    Color::Cyan,
+    Color::Magenta,
+    Color::LightGreen,
+    Color::LightCyan,
+    Color::LightMagenta,
+];
+
+/// The same rule always gets the same color: by sid, or by the signature
+/// text when an alert has no sid.
+fn rule_color(a: &Alert) -> Color {
+    let key = match a.sid {
+        Some(sid) => sid,
+        None => a.signature.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        }),
+    };
+    // Multiplicative hash, so neighbouring sids of one family do not all pick neighbouring colors.
+    let mixed = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32;
+    RULE_COLORS[(mixed % RULE_COLORS.len() as u64) as usize]
+}
+
 fn time_of(ts: &str) -> String {
     // "2026-11-10T10:11:12.000000+0000" -> "10:11:12"
     ts.split('T')
@@ -228,7 +253,7 @@ fn row_line(app: &App, a: &Alert, width: usize, selected: bool) -> Line<'static>
         let red = base.fg(Color::Red);
         push(format!("{} ", fit(&a.action, 8)), red, &mut spans);
     }
-    push(a.signature.clone(), base, &mut spans);
+    push(a.signature.clone(), base.fg(rule_color(a)), &mut spans);
     Line::from(spans)
 }
 
@@ -337,7 +362,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     };
     let opt = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
     let lines = vec![
-        field("Signature", &a.signature),
+        field_styled("Signature", &a.signature, Style::default().fg(rule_color(a))),
         field("Time", &a.ts),
         field(
             "Interface",
@@ -762,7 +787,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("j k, PgUp PgDn, g G", "scroll (detail, rule, raw, help)"),
         ("Enter", "alert detail"),
         ("Esc", "back to the list"),
-        ("i", "show / hide informational alerts"),
+        ("i", "show / hide informational alerts (shown dimmed)"),
+        ("(colors)", "the signature has one color per rule; red = blocked, yellow = major"),
         ("[ ]", "older / newer day"),
         ("r", "rule text (from detail)"),
         ("w", "raw JSON (from detail)"),
@@ -2449,5 +2475,43 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         a.mode = Mode::Help;
         let s = screen(&a, 110, 50);
         assert!(s.contains("settings (read-only) / logs"), "{s}");
+    }
+
+    fn alert_with_sig(sig: &str, sid: Option<u64>) -> Alert {
+        let mut a = alert("2026-01-01T10:00:00.000000+0000", sig, "allowed", None);
+        a.sid = sid;
+        a
+    }
+
+    #[test]
+    fn same_rule_same_color_and_palette_is_safe() {
+        let mut a = alert_with_sig("ET A", Some(2027758));
+        let c1 = rule_color(&a);
+        a.signature = "ET changed text".into();
+        assert_eq!(rule_color(&a), c1, "by sid, not by text");
+        let mut seen = std::collections::HashSet::new();
+        for sid in 2000000..2000200u64 {
+            let c = rule_color(&alert_with_sig("x", Some(sid)));
+            assert!(![Color::Red, Color::Yellow, Color::Blue].contains(&c));
+            seen.insert(format!("{c:?}"));
+        }
+        assert!(seen.len() >= 5, "colors spread over a sid family: {seen:?}");
+        // no sid: stable by text
+        let n1 = rule_color(&alert_with_sig("ET no sid", None));
+        assert_eq!(n1, rule_color(&alert_with_sig("ET no sid", None)));
+    }
+
+    #[test]
+    fn list_colors_only_the_signature_and_keeps_dim() {
+        let mut a = alert_with_sig("ET DNS Query for .cc TLD", Some(2027758));
+        a.et_severity = Some("Informational".into());
+        let line = row_line(&app(vec![]), &a, 100, false);
+        let sig = line.spans.last().unwrap();
+        assert_eq!(sig.style.fg, Some(rule_color(&a)));
+        assert!(sig.style.add_modifier.contains(Modifier::DIM));
+        for sp in &line.spans[..line.spans.len() - 1] {
+            assert_eq!(sp.style.fg, None);
+            assert!(sp.style.add_modifier.contains(Modifier::DIM));
+        }
     }
 }
