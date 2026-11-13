@@ -980,9 +980,17 @@ impl App {
 
     pub fn refresh(&mut self) {
         let r = self.range;
+        // Keep the highlighted alert highlighted: new alerts arrive at the top
+        // and would otherwise push the selection onto a different one.
+        let keep = self.selected().map(alert_key);
         self.fetch(r);
         self.set_mode(Mode::List);
         self.normalize();
+        if let Some(key) = keep {
+            if let Some(i) = self.visible().iter().position(|a| alert_key(a) == key) {
+                self.selected = i;
+            }
+        }
     }
 
     pub fn selected(&self) -> Option<&Alert> {
@@ -1074,6 +1082,12 @@ impl App {
         }
         s
     }
+}
+
+/// What identifies an alert across a refresh (the raw line is not unique in tests and
+/// two events with all of these equal are the same thing to the reader).
+fn alert_key(a: &Alert) -> String {
+    format!("{}|{}|{}|{:?}|{}", a.ts, a.src, a.dst, a.sid, a.signature)
 }
 
 /// Thousands separator: 5277 -> "5,277".
@@ -1298,6 +1312,20 @@ mod tests {
         h.app.refresh();
         assert!(h.app.selected().is_none());
         assert_eq!(h.app.selected_index(), 0);
+    }
+
+    #[test]
+    fn refresh_keeps_the_highlighted_alert_when_new_ones_arrive() {
+        let mut h = harness(sample(), 0, None);
+        h.app.move_selection(2);
+        let before = h.app.selected().unwrap().signature.clone();
+        let mut newer = sample();
+        newer.insert(0, alert("2099-01-01T00:00:00.000000+0000", "ET brand new", None, false));
+        newer[0].src = "203.0.113.9:1".into();
+        h.data.borrow_mut().insert(Range::Today, Ok(newer));
+        h.app.refresh();
+        assert_eq!(h.app.selected().unwrap().signature, before);
+        assert_eq!(h.app.selected_index(), 3);
     }
 
     #[test]

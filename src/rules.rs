@@ -103,7 +103,11 @@ impl RuleIndex {
     fn add_text(&mut self, text: &str) {
         for rule in text.lines().filter_map(parse_line) {
             match self.rules.get(&rule.sid) {
-                Some(old) if old.rev >= rule.rev => {}
+                // Higher rev wins; on an equal rev an active rule wins over a
+                // commented-out (disabled) copy of the same sid.
+                Some(old)
+                    if old.rev > rule.rev
+                        || (old.rev == rule.rev && (old.enabled || !rule.enabled)) => {}
                 _ => {
                     self.rules.insert(rule.sid, rule);
                 }
@@ -739,5 +743,19 @@ mod tests {
         assert!(!download_agent(Some("http://127.0.0.1:1/x"))
             .config()
             .https_only());
+    }
+
+    #[test]
+    fn equal_rev_prefers_the_active_copy_whatever_the_order() {
+        let off = "# alert ip any any -> any any (msg:\"off\"; sid:30; rev:2;)\n";
+        let on = "alert ip any any -> any any (msg:\"on\"; sid:30; rev:2;)\n";
+        for text in [format!("{off}{on}"), format!("{on}{off}")] {
+            let r = RuleIndex::from_text(&text);
+            assert!(r.lookup(30).unwrap().enabled, "{text}");
+        }
+        // a higher rev still beats an active older one
+        let newer_off = "# alert ip any any -> any any (msg:\"n\"; sid:30; rev:3;)\n";
+        let r = RuleIndex::from_text(&format!("{on}{newer_off}"));
+        assert_eq!(r.lookup(30).unwrap().rev, 3);
     }
 }
