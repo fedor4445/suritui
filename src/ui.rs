@@ -9,6 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SIDEBAR_MAX: u16 = 26;
 const RULE_NOTE_1: &str = "Rule text is the hub's copy of ET Open.";
@@ -41,9 +42,30 @@ fn plain(s: &str) -> Line<'static> {
     Line::from(clean(s))
 }
 
+/// Width in terminal columns (wide characters such as CJK take two).
+fn cols(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// The longest prefix of `s` that fits in `w` columns. A wide character that
+/// would straddle the edge is dropped, never split.
+fn take_cols(s: &str, w: usize) -> String {
+    let mut used = 0;
+    let mut out = String::new();
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > w {
+            break;
+        }
+        used += cw;
+        out.push(c);
+    }
+    out
+}
+
 fn fit(s: &str, w: usize) -> String {
-    let mut out: String = clean(s).chars().take(w).collect();
-    let n = out.chars().count();
+    let mut out = take_cols(&clean(s), w);
+    let n = cols(&out);
     out.extend(std::iter::repeat_n(' ', w - n));
     out
 }
@@ -127,7 +149,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     // terminals; it is right-aligned and never wider than the row.
     match scroll_indicator(app) {
         Some(ind) => {
-            let iw = (ind.chars().count() as u16).min(status.width);
+            let iw = (cols(&ind) as u16).min(status.width);
             let [l, r] =
                 Layout::horizontal([Constraint::Min(0), Constraint::Length(iw)]).areas(status);
             f.render_widget(left, l);
@@ -168,7 +190,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![head];
     for (label, n) in cats.iter().skip(offset).take(h) {
         let count = n.to_string();
-        let lw = w.saturating_sub(count.chars().count() + 1);
+        let lw = w.saturating_sub(cols(&count) + 1);
         let text = format!("{} {}", fit(label, lw), count);
         let style = if *label == app.category() {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -234,8 +256,8 @@ fn row_line(app: &App, a: &Alert, width: usize, selected: bool) -> Line<'static>
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut left = width;
     let mut push = |text: String, style: Style, spans: &mut Vec<Span<'static>>| {
-        let cell: String = clean(&text).chars().take(left).collect();
-        left -= cell.chars().count();
+        let cell: String = take_cols(&clean(&text), left);
+        left -= cols(&cell);
         spans.push(Span::styled(cell, style));
     };
     let action_blocked = a.action != "allowed" && a.action != "-";
@@ -458,7 +480,7 @@ fn category_rows(
     let mut lines = vec![Line::from(Span::styled(fit(title, w), header_style()))];
     for (label, n) in cats.iter().skip(offset).take(h) {
         let count = n.to_string();
-        let lw = w.saturating_sub(count.chars().count() + 1);
+        let lw = w.saturating_sub(cols(&count) + 1);
         let text = format!("{} {}", fit(label, lw), count);
         let style = if label == current {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -522,8 +544,8 @@ fn draw_rules_list(f: &mut Frame, app: &App, area: Rect) {
                 (format!("{state} "), state_style),
                 (e.msg.clone(), base),
             ] {
-                let cell: String = clean(&text).chars().take(left).collect();
-                left -= cell.chars().count();
+                let cell: String = take_cols(&clean(&text), left);
+                left -= cols(&cell);
                 spans.push(Span::styled(cell, style));
             }
             lines.push(Line::from(spans));
@@ -2512,6 +2534,23 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         for sp in &line.spans[..line.spans.len() - 1] {
             assert_eq!(sp.style.fg, None);
             assert!(sp.style.add_modifier.contains(Modifier::DIM));
+        }
+    }
+
+    #[test]
+    fn wide_characters_are_cut_by_columns_not_chars() {
+        // each of these takes two columns
+        assert_eq!(cols("日本語"), 6);
+        assert_eq!(take_cols("日本語", 5), "日本"); // the third would straddle column 5-6
+        assert_eq!(take_cols("日本語", 1), "");
+        assert_eq!(cols(&fit("日本語日本語", 7)), 7);
+        assert_eq!(cols(&fit("ab", 7)), 7);
+        let mut a = alert("2026-01-01T10:00:00.000000+0000", "ET 日本語日本語日本語 trojan", "allowed", None);
+        a.src = "a.b:1".into();
+        for width in [30usize, 41, 50, 63] {
+            let line = row_line(&app(vec![]), &a, width, false);
+            let total: usize = line.spans.iter().map(|s| cols(&s.content)).sum();
+            assert!(total <= width, "{total} columns in a width of {width}");
         }
     }
 }
