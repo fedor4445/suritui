@@ -39,6 +39,11 @@ enum Command {
         #[arg(long, hide = true)]
         rules_url: Option<String>,
     },
+    /// Print the sudoers file for local mode (the account that runs suritui on the router)
+    PrintSudoers {
+        /// The unix account that will run suritui
+        user: String,
+    },
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -186,6 +191,16 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     };
     match cli.command {
+        Some(Command::PrintSudoers { user }) => match suritui::sudoers::render(&user) {
+            Ok(t) => {
+                print!("{t}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("suritui: {e}");
+                ExitCode::from(1)
+            }
+        },
         Some(Command::UpdateRules { common, rules_url }) => {
             let cfg = match load_config(&common, &home, false) {
                 Ok(c) => c,

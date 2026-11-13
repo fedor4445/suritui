@@ -60,3 +60,14 @@ fn update_rules_without_router_not_required() {
     assert!(!err.contains("panicked"), "{err}");
     assert!(err.contains("download"), "{err}");
 }
+
+#[test]
+fn print_sudoers_prints_a_checked_file_or_refuses() {
+    let home = temp_home("sudoers");
+    let ok = run(&home, &["print-sudoers", "alice"]);
+    assert!(ok.status.success());
+    let t = String::from_utf8_lossy(&ok.stdout);
+    assert!(t.contains("alice ALL=(root) NOPASSWD: SURITUI") && t.contains("suritui-admin source key *"), "{t}");
+    let bad = run(&home, &["print-sudoers", "root"]);
+    assert!(!bad.status.success() && bad.stdout.is_empty());
+}
