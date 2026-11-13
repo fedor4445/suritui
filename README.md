@@ -1,21 +1,126 @@
 # suritui
 
-A read-only terminal viewer for Suricata alerts. It shows the alerts of a
-Suricata sensor (for example on a router) in a sidebar-and-list screen with
-vi-style keys: alerts grouped by Emerging Threats category, a key to hide
-informational ones, the last 14 days, a detail view, the full rule text, and
-the raw JSON.
+A terminal UI for Suricata on a FreeBSD router: look at the alerts, and, if
+you want, manage the rules from the same screen. Vi-style keys, a handful of
+screens, a confirmation before every change.
 
-## Read-only guarantee
+It was written for one home router running Suricata 8 as a passive IDS
+(`--pcap`) under the unprivileged `suricata` user, and it has only run there
+and on one test VM. Read "What it has not been tested on" before you trust it
+with a router that matters to you.
 
-suritui never writes to the router and never changes Suricata, its
-configuration or its rules. The viewer reads alert lines over ssh and makes no
-other network call. The one exception is the separate command
-`suritui update-rules`, which downloads the public Emerging Threats Open rules
-tarball to your own machine (see below). There is no key that disables a rule,
-reloads Suricata or blocks anything.
+**How it was made.** It was written with Claude through Claude Code. The
+author directed and tested it but did not write the code by hand.
 
-## How it works
+## Two ways to use it
+
+| | Remote (read-only) | Local (on the router) |
+|---|---|---|
+| Where it runs | any machine that can ssh to the router | on the router |
+| Alerts | yes, over a restricted ssh account | yes, through the helper |
+| Rule text | a local copy of ET Open | the rules Suricata really loads |
+| Change anything on the router | **never** | yes: disable or enable a rule, silence a source, update rules, switch rule sources, store a source key |
+| Needs on the router | one forced-command script (below) | `suritui-admin` plus a sudoers file (below) |
+
+Remote mode keeps the original guarantee: suritui never writes to the router
+and never changes Suricata. Local mode can change things, so it is built
+differently (next section).
+
+## Local mode: what can change, and how it is kept safe
+
+Local mode is for running `suritui --local` on the router itself. The TUI never
+runs as root. Everything that needs root is one small program,
+`suritui-admin`, that the TUI starts through `sudo -n`. The sudoers file lists
+exactly the helper commands the TUI uses and nothing else
+(`suritui print-sudoers ACCOUNT` prints it). The helper accepts a fixed set of
+verbs, takes no paths or free text, and checks its own arguments again.
+
+What it can change, and nothing more:
+
+- `disable.conf` / `enable.conf` (disable or enable one rule by SID)
+- `threshold.config` (silence a rule for one source or destination)
+- the rule set: it runs `suricata-update` and reloads Suricata live (no restart)
+- the list of rule sources and, for a source that needs one, its access code
+
+How a change is made:
+
+1. It takes a lock, so two changes never run at once.
+2. It builds the new rules in a scratch directory first.
+3. It compares them with the live rules. A change is refused unless the only
+   differences are the rule you asked for and a few rules that depend on it
+   (more than 25 other rules flipping means something is wrong).
+4. It keeps a backup, installs the new files, reloads Suricata and waits until
+   the reload has really finished.
+5. If anything fails, every file goes back and Suricata reloads again.
+   Changing a source works the same way: a failed download, check or reload
+   puts the whole sources folder back.
+
+Source access codes are read from stdin (never from the command line), kept in
+a file only root can read, scrubbed from every output and log line, and never
+shown on a confirmation screen. The helper refuses to change sources or store
+a code unless `/var/lib/suricata` and `/var/lib/suricata/update` belong to root
+(otherwise Suricata's account could swap them); see Install.
+
+It is meant for a **passive IDS** (`suricata --pcap`). It does not manage
+drop/reject rules or an inline IPS, and it has not been tried with one.
+
+### Install (local mode, FreeBSD)
+
+You need Rust, `sudo`, Suricata with `suricata-update`, and an ordinary account
+that will run suritui. Build, then run the installer from the top of the source
+tree:
+
+```
+cargo build --release
+sudo sh contrib/freebsd/install.sh ACCOUNT
+```
+
+The installer checks everything first, keeps the old programs as `*.prev`,
+installs `suritui` and `suritui-admin`, generates the sudoers file from the
+program you just built, and puts the old sudoers file back if the combined
+sudoers files stop parsing. It does not touch Suricata or its files. Read it
+before you run it; it is short.
+
+Optional, once, to switch rule sources and store keys from screen 3:
+
+```
+chown root:wheel /var/lib/suricata /var/lib/suricata/update
+```
+
+Without it everything else works, and the Sources screen explains why it
+refuses. Then run `suritui --local` as `ACCOUNT` (or set `local = true` in the
+config file).
+
+The helper expects the FreeBSD package layout: `/usr/local/etc/suricata/`
+(`disable.conf`, `enable.conf`, `threshold.config`, `suricata.yaml`),
+`/var/lib/suricata`, `/var/log/suricata` (`eve.json`, rotated as
+`eve.json.N.gz`), `suricata-update` and `suricatasc` in `/usr/local/bin`.
+Backups go to `/var/backups/suritui`, the helper's own log to
+`/var/log/suritui-admin.log`.
+
+The daily rule update is yours to schedule (for example a root cron job that
+runs `suricata-update` and a reload). If that job writes the update output to a
+log, make it blank access codes (`oinkcode=`, `secret-code`) first, or a failed
+download of a keyed source could put the code in that log.
+
+### Screens in local mode
+
+| Key | Screen |
+|-----|--------|
+| `1` | alerts (the main screen, below) |
+| `2` | rules: `/` search, `s` state filter, `c` clear, `d` / `e` disable / enable the highlighted rule |
+| `3` | rule sources: `j` `k` move, `e` switch on (asks for a code if needed), `d` switch off, `R` fetch the current source list |
+| `4` | updates: `U` update the rules now |
+| `5` | suppress list: `x` removes the highlighted entry |
+| `6` | settings (read-only) |
+| `7` | logs (`Tab` for the next one) |
+| `y` / `Esc` | confirm / cancel a change |
+
+On an alert: `d` disables its rule, `s` / `S` silences the rule for that source
+or destination. Every change asks first, then shows progress, then "Done" or
+"Failed" with the reason.
+
+## Remote mode: how it works
 
 suritui runs `ssh` (with a fixed argument list, never through a shell) and
 asks the router for one of exactly two things:
@@ -81,8 +186,9 @@ naming to your system.
 cargo build --release
 ```
 
-The binary is `target/release/suritui`. It needs a Rust toolchain and the
-`ssh` command at run time.
+This builds `target/release/suritui` (the TUI) and `target/release/suritui-admin`
+(the root helper, local mode only). It needs a Rust toolchain; remote mode also
+needs the `ssh` command at run time.
 
 ## Configuration
 
@@ -93,6 +199,7 @@ suritui reads `~/.config/suritui/config.toml`:
 router = "<router-address>"
 
 # optional
+local = false                       # true: run on the router itself (local mode)
 user = "alertview"                  # ssh user on the router (default: alertview)
 rules_dir = "/path/to/rules"        # local copy of the ET rules
                                     # (default: ~/.local/share/suritui/rules)
@@ -111,6 +218,7 @@ Flags override the file:
 | `--router <HOST>` | router to read alerts from |
 | `--user <NAME>` | ssh user on the router |
 | `--rules-dir <DIR>` | directory with the local copy of the rules |
+| `--local` | run on the router itself (local mode; no router address needed) |
 
 The flags also work after `update-rules`. Without a router address the viewer
 exits with a message; `update-rules` does not need one.
@@ -222,16 +330,38 @@ refreshing returns you to the list.
   by name (never by archive path).
 - The real download uses HTTPS only.
 
+## What it has not been tested on
+
+- One router (FreeBSD, Suricata 8.0.7, passive `--pcap`, ET Open) and one
+  FreeBSD test VM. Other FreeBSD versions, Suricata versions, pfSense/OPNsense
+  layouts and Linux are untested; Linux is not a goal.
+- Inline IPS setups: untested, not supported.
+- Rule sources other than ET Open and a free source (`oisf/trafficid`): the
+  paid ET Pro style key flow was rehearsed against the real servers with a
+  made-up key only (it failed cleanly and everything was put back). A
+  successful run with a real key is covered by unit tests, not by a live test.
+- Snort's registered rules do **not** load in Suricata 8 (Suricata refuses
+  some of their syntax). suritui does not offer them; a failed load is rolled
+  back, but there is no point in trying.
+- Silencing an alert from the alert screen (`s` / `S`) has unit tests but no
+  live run against a real alert yet.
+- The installer's "put the old sudoers file back" path has not been triggered
+  on a real machine.
+- Nobody but the author has read the helper. It runs as root; read
+  `src/bin/suritui-admin.rs`, `src/admin.rs`, `src/update.rs` and
+  `src/sources.rs` before you install it.
+
 ## Known limitations
 
-- The rule and help screens do not scroll: text longer than the terminal is
-  cut off. Only the detail and raw JSON screens scroll.
 - Text width is counted in characters, not display cells, so wide (CJK, emoji)
   characters can misalign columns.
-- ssh runs with `ConnectTimeout=10`, `ServerAliveInterval=10` and
+- ssh (remote mode) runs with `ConnectTimeout=10`, `ServerAliveInterval=10` and
   `ServerAliveCountMax=3`, so an unreachable or hung router fails after about
   10 to 40 seconds, but the screen is still blocked until then.
-- Data is limited to today plus the 14 rotated logs the router script serves;
-  there is no combined multi-day view.
+- Alert data is limited to today plus the 14 rotated logs; there is no combined
+  multi-day view.
 - On narrow terminals the signature column shrinks first. The sidebar does not
   scroll: with more categories than rows, the extra ones are cut off.
+- A rule change or source change takes about two minutes (the full rule set is
+  rebuilt and checked first); the screen shows progress and cannot be left
+  meanwhile.
