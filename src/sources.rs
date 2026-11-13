@@ -26,6 +26,7 @@ pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && !s.starts_with('/')
+        && !s.starts_with('-') // never read as an option by suricata-update
         && !s.contains("..")
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_.-".contains(&b))
 }
@@ -492,7 +493,7 @@ mod tests {
     #[test]
     fn names_and_keys_are_checked() {
         assert!(valid_name("et/open") && valid_name("abuse.ch/sslbl-ja3"));
-        for bad in ["", "/etc", "a..b", "a b", "a;b", "a\nb", "$(x)", &"a".repeat(65)] {
+        for bad in ["", "/etc", "-x", "--help", "-oFoo", "a..b", "a b", "a;b", "a\nb", "$(x)", &"a".repeat(65)] {
             assert!(!valid_name(bad), "{bad:?}");
         }
         assert!(valid_key("0123456789abcdef0123456789abcdef01234567") && valid_key("ab_cd-ef12"));
