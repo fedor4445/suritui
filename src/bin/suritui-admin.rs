@@ -15,11 +15,23 @@
 //!
 //! Nothing else is accepted: no options, no paths, no free text.
 
+use std::io::Write;
 use std::process::ExitCode;
 use suritui::admin::{apply, parse_sid, read_alerts, read_log, read_rules, status, Paths, ReadError, SystemRunner, Verb};
 use suritui::threshold::{apply_suppress, Track};
 use suritui::update::{apply_update, info};
 use suritui::source::Range;
+
+/// The reader closed the pipe (for example `| head`): not an error, stop quietly.
+/// Anything else that stops stdout is a real failure.
+fn print_failed(e: &std::io::Error) -> ExitCode {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("suritui-admin: cannot write output: {e}");
+        ExitCode::from(1)
+    }
+}
 
 fn usage() -> ExitCode {
     eprintln!("usage: suritui-admin status | info | log suricata|update|admin | update | suppress|unsuppress SID by_src|by_dst IP | rules | sources [refresh] | source enable|disable NAME | source key NAME | alerts live | alerts day K | disable SID | enable SID");
@@ -46,8 +58,10 @@ fn main() -> ExitCode {
         ["log", name] => Some(match read_log(&paths, name, &mut std::io::stdout().lock()) {
             // A log that has not been written yet is not an error for the screen.
             Err(ReadError::NoSuchDay) => {
-                println!("(this log file does not exist yet)");
-                Ok(())
+                match writeln!(std::io::stdout(), "(this log file does not exist yet)") {
+                    Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(ReadError::Other(e.to_string())),
+                    _ => Ok(()),
+                }
             }
             other => other,
         }),
@@ -62,6 +76,7 @@ fn main() -> ExitCode {
         return match r {
             Ok(()) => ExitCode::SUCCESS,
             Err(ReadError::NoSuchDay) => ExitCode::from(3),
+            Err(ReadError::OutputClosed) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("suritui-admin: {e}");
                 ExitCode::from(1)
@@ -100,10 +115,18 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(rep) => {
+            // Printing comes after the work is done, so a reader that went away
+            // (`| head`) must not turn a finished change into a panic.
+            let mut out = std::io::stdout().lock();
             for l in rep.lines {
-                println!("{}", suritui::sources::redact(&paths, &l));
+                if let Err(e) = writeln!(out, "{}", suritui::sources::redact(&paths, &l)) {
+                    return print_failed(&e);
+                }
             }
-            ExitCode::SUCCESS
+            match out.flush() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => print_failed(&e),
+            }
         }
         Err(e) => {
             eprintln!("suritui-admin: {}", suritui::sources::redact(&paths, &e));

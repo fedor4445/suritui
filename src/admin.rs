@@ -720,6 +720,8 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReadError {
     NoSuchDay,
+    /// The reader of our output went away (`| head`): stop quietly.
+    OutputClosed,
     Other(String),
 }
 
@@ -727,8 +729,18 @@ impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReadError::NoSuchDay => write!(f, "no alert log for that day"),
+            ReadError::OutputClosed => write!(f, "output closed"),
             ReadError::Other(m) => write!(f, "{m}"),
         }
+    }
+}
+
+/// A failed write to our output: a closed pipe is not an error.
+fn out_err(what: &str, e: std::io::Error) -> ReadError {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        ReadError::OutputClosed
+    } else {
+        ReadError::Other(io(what, e))
     }
 }
 
@@ -762,7 +774,7 @@ fn copy_alert_lines<R: std::io::Read, W: std::io::Write>(r: R, w: &mut W) -> Res
             if !line.ends_with(b"\n") {
                 line.push(b'\n');
             }
-            w.write_all(&line).map_err(|e| ReadError::Other(io("write", e)))?;
+            w.write_all(&line).map_err(|e| out_err("write", e))?;
         }
     }
 }
@@ -816,7 +828,7 @@ pub fn read_log<W: std::io::Write>(paths: &Paths, name: &str, w: &mut W) -> Resu
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(LOG_TAIL_LINES);
     for l in &lines[start..] {
-        writeln!(w, "{l}").map_err(|e| ReadError::Other(io("write", e)))?;
+        writeln!(w, "{l}").map_err(|e| out_err("write", e))?;
     }
     Ok(())
 }
@@ -824,7 +836,7 @@ pub fn read_log<W: std::io::Write>(paths: &Paths, name: &str, w: &mut W) -> Resu
 /// `rules`: print the live rules file, so the TUI can show what is loaded.
 pub fn read_rules<W: std::io::Write>(paths: &Paths, w: &mut W) -> Result<(), ReadError> {
     let mut f = open_plain(&paths.rules)?;
-    std::io::copy(&mut f, w).map_err(|e| ReadError::Other(io("read the rules", e)))?;
+    std::io::copy(&mut f, w).map_err(|e| out_err("read the rules", e))?;
     Ok(())
 }
 
@@ -1519,5 +1531,21 @@ mod tests {
         assert!(e.contains("could not load 3 rules"), "{e}");
         assert_eq!(fs::read_to_string(&p.rules).unwrap(), live);
         assert_eq!(fs::read_to_string(&p.disable_conf).unwrap(), "5\n");
+    }
+
+    struct ClosedPipe;
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_output_is_not_an_error() {
+        let (_t, p) = setup("closed-pipe", &rules(&[R_ON]), "");
+        assert!(matches!(read_rules(&p, &mut ClosedPipe), Err(ReadError::OutputClosed)));
     }
 }
