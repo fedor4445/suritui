@@ -31,6 +31,8 @@ pub struct Overrides {
 pub enum ConfigError {
     MissingRouter,
     Parse(String),
+    /// A router host or ssh user that is not safe to hand to ssh.
+    Invalid(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -43,6 +45,7 @@ impl std::fmt::Display for ConfigError {
                 )
             }
             ConfigError::Parse(m) => write!(f, "cannot read config: {m}"),
+            ConfigError::Invalid(m) => write!(f, "invalid setting: {m}"),
         }
     }
 }
@@ -50,6 +53,7 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     router: Option<String>,
     user: Option<String>,
@@ -70,6 +74,13 @@ impl Config {
         let file = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str::<FileConfig>(&text)
                 .map_err(|e| ConfigError::Parse(e.to_string()))?,
+            // A file named with --config must exist; only the default one is optional.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && o.config_path.is_some() => {
+                return Err(ConfigError::Parse(format!(
+                    "{}: no such file (named with --config)",
+                    path.display()
+                )))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
             Err(e) => return Err(ConfigError::Parse(format!("{}: {e}", path.display()))),
         };
@@ -84,20 +95,27 @@ impl Config {
             (None, true) => String::new(),
             (None, false) => return Err(ConfigError::MissingRouter),
         };
+        let user = o
+            .user
+            .clone()
+            .or(file.user)
+            .unwrap_or_else(|| DEFAULT_USER.to_string());
+        if !local {
+            check_host(&router)?;
+            check_user(&user)?;
+        }
         Ok(Config {
             local,
             router,
-            user: o
-                .user
-                .clone()
-                .or(file.user)
-                .unwrap_or_else(|| DEFAULT_USER.to_string()),
+            user,
             labels: file.labels,
-            rules_dir: o
-                .rules_dir
-                .clone()
-                .or(file.rules_dir)
-                .unwrap_or_else(|| home.join(".local/share/suritui/rules")),
+            rules_dir: expand_home(
+                o.rules_dir
+                    .clone()
+                    .or(file.rules_dir)
+                    .unwrap_or_else(|| home.join(".local/share/suritui/rules")),
+                home,
+            ),
             et_version: file
                 .et_version
                 .unwrap_or_else(|| DEFAULT_ET_VERSION.to_string()),
@@ -110,6 +128,50 @@ impl Config {
             .get(iface)
             .cloned()
             .unwrap_or_else(|| iface.to_string())
+    }
+}
+
+/// `~` and `~/...` at the start of a path mean the home directory.
+fn expand_home(p: PathBuf, home: &Path) -> PathBuf {
+    if p == Path::new("~") {
+        home.to_path_buf()
+    } else if let Ok(rest) = p.strip_prefix("~") {
+        home.join(rest)
+    } else {
+        p
+    }
+}
+
+/// A host name or address that is safe to pass to ssh: letters, digits and
+/// `. - _ :` only, not starting with `-` (ssh would read it as an option).
+fn check_host(h: &str) -> Result<(), ConfigError> {
+    let ok = !h.is_empty()
+        && h.len() <= 253
+        && !h.starts_with('-')
+        && h.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(format!(
+            "router {h:?}: use a host name or IP address (letters, digits, . - _ :)"
+        )))
+    }
+}
+
+/// A unix account name that is safe to pass to ssh.
+fn check_user(u: &str) -> Result<(), ConfigError> {
+    let ok = !u.is_empty()
+        && u.len() <= 64
+        && !u.starts_with('-')
+        && u.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(format!(
+            "user {u:?}: use letters, digits, . - _ (not starting with -)"
+        )))
     }
 }
 
@@ -228,5 +290,86 @@ mod tests {
         let h = TempHome::new("remote-missing");
         let e = Config::load(&Overrides::default(), &h.0).unwrap_err();
         assert_eq!(e, ConfigError::MissingRouter);
+    }
+
+    #[test]
+    fn explicit_config_must_exist_default_may_not() {
+        let h = TempHome::new("explicit");
+        let o = Overrides {
+            router: Some("192.0.2.1".into()),
+            config_path: Some(h.0.join("nope.toml")),
+            ..Default::default()
+        };
+        let e = Config::load(&o, &h.0).unwrap_err();
+        assert!(matches!(&e, ConfigError::Parse(m) if m.contains("nope.toml")));
+        let o = Overrides {
+            router: Some("192.0.2.1".into()),
+            ..Default::default()
+        };
+        assert!(Config::load(&o, &h.0).is_ok());
+    }
+
+    #[test]
+    fn unknown_config_key_is_an_error() {
+        let h = TempHome::new("unknown");
+        h.write_config("router = \"192.0.2.1\"\nrouterr = \"x\"\n");
+        let e = Config::load(&Overrides::default(), &h.0).unwrap_err();
+        assert!(matches!(&e, ConfigError::Parse(m) if m.contains("routerr")));
+    }
+
+    #[test]
+    fn tilde_in_rules_dir_is_expanded() {
+        let h = TempHome::new("tilde");
+        h.write_config("router = \"192.0.2.1\"\nrules_dir = \"~/r\"\n");
+        let c = Config::load(&Overrides::default(), &h.0).unwrap();
+        assert_eq!(c.rules_dir, h.0.join("r"));
+        assert_eq!(expand_home(PathBuf::from("~"), &h.0), h.0);
+        assert_eq!(
+            expand_home(PathBuf::from("~other/x"), &h.0),
+            PathBuf::from("~other/x")
+        );
+        assert_eq!(expand_home(PathBuf::from("/a/~"), &h.0), PathBuf::from("/a/~"));
+    }
+
+    #[test]
+    fn hostile_router_or_user_is_refused() {
+        let h = TempHome::new("hostile");
+        for bad in ["-oProxyCommand=x", "a b", "a;b", "", "h@x", "a\nb", "-"] {
+            let o = Overrides {
+                router: Some(bad.into()),
+                ..Default::default()
+            };
+            // an empty router is "missing", everything else "invalid"
+            assert!(Config::load(&o, &h.0).is_err(), "router {bad:?}");
+        }
+        for bad in ["-oProxyCommand=x", "a b", "a@b", "", "a/b", "x\ty"] {
+            let o = Overrides {
+                router: Some("192.0.2.1".into()),
+                user: Some(bad.into()),
+                ..Default::default()
+            };
+            assert!(
+                matches!(Config::load(&o, &h.0), Err(ConfigError::Invalid(_))),
+                "user {bad:?}"
+            );
+        }
+        for good in ["192.0.2.1", "router.example.org", "fe80::1", "my_host-2"] {
+            let o = Overrides {
+                router: Some(good.into()),
+                ..Default::default()
+            };
+            assert!(Config::load(&o, &h.0).is_ok(), "router {good:?}");
+        }
+    }
+
+    #[test]
+    fn local_mode_skips_ssh_checks() {
+        let h = TempHome::new("local-skip");
+        let o = Overrides {
+            local: true,
+            user: Some("a b".into()),
+            ..Default::default()
+        };
+        assert!(Config::load(&o, &h.0).is_ok());
     }
 }

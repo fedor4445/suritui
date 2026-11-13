@@ -137,6 +137,8 @@ impl SshSource {
         .iter()
         .map(|s| s.to_string())
         .collect();
+        // `--`: whatever the target looks like, ssh must not read it as an option.
+        args.push("--".to_string());
         args.push(self.target.clone());
         args.extend(r.remote_args());
         args
@@ -231,13 +233,14 @@ mod tests {
                 "ServerAliveInterval=10",
                 "-o",
                 "ServerAliveCountMax=3",
+                "--",
                 "alertview@198.51.100.1",
                 "live"
             ]
         );
         assert_eq!(
             s.ssh_args(Range::Day(2))[10..],
-            ["alertview@198.51.100.1", "day", "2"]
+            ["--", "alertview@198.51.100.1", "day", "2"]
         );
     }
 
