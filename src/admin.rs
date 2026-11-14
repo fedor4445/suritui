@@ -250,11 +250,25 @@ pub struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, prog: &str, args: &[&str]) -> Result<Out, String> {
-        let out = Command::new(prog)
-            .args(args)
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new(prog);
+        cmd.args(args)
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin")
-            .env("LANG", "C")
+            .env("LANG", "C");
+        // The helper ignores hangup/interrupt/terminate while it changes files;
+        // an ignored signal stays ignored across exec, so children must get the
+        // defaults back or `timeout` could no longer stop them.
+        // SAFETY: only async-signal-safe `signal` calls run between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
+                Ok(())
+            });
+        }
+        let out = cmd
             .output()
             .map_err(|e| format!("cannot run {prog}: {e}"))?;
         Ok(Out {
@@ -1632,6 +1646,17 @@ mod tests {
         let shown = String::from_utf8(out).unwrap();
         assert!(!shown.contains('y'), "the padding before the window is not shown");
         assert!(shown.lines().next().is_some_and(|l| l.len() == 63), "first shown line is whole");
+    }
+
+    #[test]
+    fn children_get_the_default_signals_back_even_when_the_helper_ignores_them() {
+        // SAFETY: plain signal() calls; the old disposition is put back at the end.
+        let old = unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        let out = SystemRunner.run("/bin/sh", &["-c", "kill -TERM $$; echo survived"]).unwrap();
+        unsafe {
+            libc::signal(libc::SIGTERM, old);
+        }
+        assert!(!out.stdout.contains("survived"), "the child must die of SIGTERM: {}", out.stdout);
     }
 
     #[test]
