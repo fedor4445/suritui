@@ -137,7 +137,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Rules if app.browser.as_ref().is_some_and(|b| b.editing) => {
             "  typing a search: Enter keeps it, Esc drops it"
         }
-        Mode::Rules if app.can_change() => "  / search   s state   d disable   e enable   Enter rule   1 alerts",
+        Mode::Rules if app.can_change() => "  / search   s state   c clear   d disable   e enable   Enter rule   1 alerts   3 sources",
         Mode::Rules => "  / search   s state   c clear   Enter rule   1 alerts   3 sources",
         Mode::Sources if !app.can_change() => "  j k move   1 alerts   2 rules   4 updates   Esc back",
         Mode::Sources => "  j k move   e switch on   d switch off   R refresh list   1 alerts   2 rules   Esc back",
@@ -194,28 +194,8 @@ fn scroll_indicator(app: &App) -> Option<String> {
 fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     // Keep the last column blank as a gap before the list.
     let w = (area.width as usize).saturating_sub(1);
-    let head = Line::from(Span::styled(fit("Categories", w), header_style()));
-    let cats = app.categories();
     let h = (area.height as usize).saturating_sub(1);
-    // The header stays pinned; the category rows scroll so the current one
-    // is always visible.
-    let sel = cats
-        .iter()
-        .position(|(label, _)| *label == app.category())
-        .unwrap_or(0);
-    let offset = scroll_offset(sel, h);
-    let mut lines = vec![head];
-    for (label, n) in cats.iter().skip(offset).take(h) {
-        let count = n.to_string();
-        let lw = w.saturating_sub(cols(&count) + 1);
-        let text = format!("{} {}", fit(label, lw), count);
-        let style = if *label == app.category() {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(Span::styled(fit(&text, w), style)));
-    }
+    let lines = category_rows(&app.categories(), app.category(), w, h, "Categories");
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -270,30 +250,20 @@ fn row_line(app: &App, a: &Alert, width: usize, selected: bool) -> Line<'static>
     } else {
         row_style(a)
     };
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut left = width;
-    let mut push = |text: String, style: Style, spans: &mut Vec<Span<'static>>| {
-        let cell: String = take_cols(&clean(&text), left);
-        left = left.saturating_sub(cols(&cell));
-        spans.push(Span::styled(cell, style));
-    };
+    let mut cells = Cells::new(width);
     let action_blocked = a.action != "allowed" && a.action != "-";
     // Fixed columns first; the signature takes whatever is left, so it is
     // the first thing to shrink on narrow terminals.
-    push(format!("{} ", fit(&time_of(&a.ts), 8)), base, &mut spans);
-    push(
-        format!("{} ", fit(&app.label(&a.iface), 8)),
-        base,
-        &mut spans,
-    );
-    push(format!("{} ", fit(&a.src, 21)), base, &mut spans);
-    push(format!("{} ", fit(&a.dst, 21)), base, &mut spans);
+    cells.push(&format!("{} ", fit(&time_of(&a.ts), 8)), base);
+    cells.push(&format!("{} ", fit(&app.label(&a.iface), 8)), base);
+    cells.push(&format!("{} ", fit(&a.src, 21)), base);
+    cells.push(&format!("{} ", fit(&a.dst, 21)), base);
     if action_blocked {
         let red = base.fg(Color::Red);
-        push(format!("{} ", fit(&a.action, 8)), red, &mut spans);
+        cells.push(&format!("{} ", fit(&a.action, 8)), red);
     }
-    push(a.signature.clone(), base.fg(rule_color(a)), &mut spans);
-    Line::from(spans)
+    cells.push(&a.signature, base.fg(rule_color(a)));
+    cells.line()
 }
 
 fn draw_list(f: &mut Frame, app: &App, area: Rect) {
@@ -484,6 +454,29 @@ fn draw_raw(f: &mut Frame, app: &App, area: Rect) {
     scroll_screen(f, app, area, "Raw JSON", lines);
 }
 
+/// A row built cell by cell: each cell is cut to the width still left, so a
+/// row never overflows its line however wide the text is.
+struct Cells {
+    left: usize,
+    spans: Vec<Span<'static>>,
+}
+
+impl Cells {
+    fn new(width: usize) -> Cells {
+        Cells { left: width, spans: Vec::new() }
+    }
+
+    fn push(&mut self, text: &str, style: Style) {
+        let cell: String = take_cols(&clean(text), self.left);
+        self.left = self.left.saturating_sub(cols(&cell));
+        self.spans.push(Span::styled(cell, style));
+    }
+
+    fn line(self) -> Line<'static> {
+        Line::from(self.spans)
+    }
+}
+
 /// Category rows with the current one kept in view (header pinned).
 fn category_rows(
     cats: &[(String, usize)],
@@ -554,18 +547,11 @@ fn draw_rules_list(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 base.fg(Color::Red)
             };
-            let mut left = w;
-            let mut spans = Vec::new();
-            for (text, style) in [
-                (format!("{:<9} ", e.sid), base),
-                (format!("{state} "), state_style),
-                (e.msg.clone(), base),
-            ] {
-                let cell: String = take_cols(&clean(&text), left);
-                left = left.saturating_sub(cols(&cell));
-                spans.push(Span::styled(cell, style));
-            }
-            lines.push(Line::from(spans));
+            let mut cells = Cells::new(w);
+            cells.push(&format!("{:<9} ", e.sid), base);
+            cells.push(&format!("{state} "), state_style);
+            cells.push(&e.msg, base);
+            lines.push(cells.line());
         }
     }
     f.render_widget(Paragraph::new(lines), area);
