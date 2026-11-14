@@ -15,6 +15,8 @@ use unicode_width::UnicodeWidthStr;
 const SIDEBAR_MAX: u16 = 26;
 const RULE_NOTE_1: &str = "Rule text is the hub's copy of ET Open.";
 const RULE_NOTE_2: &str = "Whether the router has this rule enabled or disabled is not known here.";
+/// Local mode reads the merged rule file Suricata loads, so the text and the state are the router's own.
+const RULE_NOTE_LOCAL: &str = "Rule text is from this router's own rule set (the merged file Suricata loads).";
 
 fn header_style() -> Style {
     Style::default()
@@ -415,8 +417,13 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_rule(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    match app.rule_view() {
-        RuleView::Found { text, warning } => {
+    let view = app.rule_view();
+    let state = match &view {
+        RuleView::Found { enabled, .. } => Some(*enabled),
+        _ => None,
+    };
+    match view {
+        RuleView::Found { text, warning, .. } => {
             if let Some(w) = warning {
                 lines.push(Line::from(Span::styled(
                     clean(&w),
@@ -435,8 +442,19 @@ fn draw_rule(f: &mut Frame, app: &App, area: Rect) {
         RuleView::NoSid => lines.push(Line::from("This alert carries no sid.")),
     }
     lines.push(Line::default());
-    lines.push(Line::from(RULE_NOTE_1));
-    lines.push(Line::from(RULE_NOTE_2));
+    if app.is_local() {
+        lines.push(Line::from(RULE_NOTE_LOCAL));
+        match state {
+            Some(true) => lines.push(Line::from("State on this router: enabled.")),
+            Some(false) => lines.push(Line::from(
+                "State on this router: disabled (commented out in the merged rule file).",
+            )),
+            None => {}
+        }
+    } else {
+        lines.push(Line::from(RULE_NOTE_1));
+        lines.push(Line::from(RULE_NOTE_2));
+    }
     scroll_screen(f, app, area, "Rule", lines);
 }
 
@@ -1203,6 +1221,26 @@ mod tests {
         assert!(
             s.contains("Whether the router has this rule enabled or disabled is not known here.")
         );
+    }
+
+    #[test]
+    fn local_rule_screen_states_the_rules_own_state_and_not_the_hub_note() {
+        for (text, expect, other) in [
+            ("alert tcp any any -> any any (msg:\"x\"; sid:7; rev:1;)\n", "State on this router: enabled.", "disabled (commented"),
+            ("# alert tcp any any -> any any (msg:\"x\"; sid:7; rev:1;)\n", "State on this router: disabled (commented out", "State on this router: enabled."),
+        ] {
+            let mut al = alert("1", "ET A x", "allowed", None);
+            al.sid = Some(7);
+            al.rev = Some(1);
+            let mut a = app_local_with(vec![(Range::Today, vec![al])], Some(crate::rules::RuleIndex::from_text(text)));
+            a.mode = Mode::Rule;
+            let s = screen(&a, 110, 20);
+            assert!(s.contains("this router's own rule set"), "{s}");
+            assert!(s.contains(expect), "{s}");
+            assert!(!s.contains(other), "{s}");
+            assert!(!s.contains("hub's copy"), "{s}");
+            assert!(!s.contains("not known here"), "{s}");
+        }
     }
 
     #[test]

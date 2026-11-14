@@ -109,6 +109,8 @@ pub enum RuleView {
     Found {
         text: String,
         warning: Option<String>,
+        /// False when the rule is commented out in the rule set it came from.
+        enabled: bool,
     },
     NoSid,
 }
@@ -1075,6 +1077,7 @@ impl App {
             Some(rule) => RuleView::Found {
                 text: rule.text.clone(),
                 warning: rev_warning(a.rev, rule),
+                enabled: rule.enabled,
             },
         }
     }
@@ -1672,7 +1675,7 @@ mod tests {
             Some(idx),
         );
         match h.app.rule_view() {
-            RuleView::Found { text, warning } => {
+            RuleView::Found { text, warning, .. } => {
                 assert!(text.contains("sid:1"));
                 assert_eq!(
                     warning.as_deref(),

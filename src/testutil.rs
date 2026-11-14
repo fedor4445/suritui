@@ -52,13 +52,22 @@ impl AlertSource for Fake {
 }
 
 pub fn app_with(days: Vec<(Range, Vec<Alert>)>, rules: Option<RuleIndex>) -> App {
+    app_build(days, rules, false)
+}
+
+/// Like `app_with`, but running in local mode (on the router itself).
+pub fn app_local_with(days: Vec<(Range, Vec<Alert>)>, rules: Option<RuleIndex>) -> App {
+    app_build(days, rules, true)
+}
+
+fn app_build(days: Vec<(Range, Vec<Alert>)>, rules: Option<RuleIndex>, local: bool) -> App {
     let cfg = Config {
         router: "router.example".to_string(),
         user: "viewer".to_string(),
         labels: HashMap::from([("if0".to_string(), "wan".to_string())]),
         rules_dir: PathBuf::from("/nonexistent"),
         et_version: "7".to_string(),
-        local: false,
+        local,
     };
     App::new(cfg, Box::new(Fake(days.into_iter().collect())), rules)
 }
