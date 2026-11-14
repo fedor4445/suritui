@@ -104,6 +104,8 @@ impl Config {
             check_host(&router)?;
             check_user(&user)?;
         }
+        let et_version = file.et_version.unwrap_or_else(|| DEFAULT_ET_VERSION.to_string());
+        check_et_version(&et_version)?;
         Ok(Config {
             local,
             router,
@@ -116,9 +118,7 @@ impl Config {
                     .unwrap_or_else(|| home.join(".local/share/suritui/rules")),
                 home,
             ),
-            et_version: file
-                .et_version
-                .unwrap_or_else(|| DEFAULT_ET_VERSION.to_string()),
+            et_version,
         })
     }
 
@@ -160,6 +160,20 @@ fn check_host(h: &str) -> Result<(), ConfigError> {
 }
 
 /// A unix account name that is safe to pass to ssh.
+/// The ET Open rules version goes into a download URL path: digits and dots
+/// only, so a config value can never add path segments, a query or a fragment.
+fn check_et_version(v: &str) -> Result<(), ConfigError> {
+    let ok = !v.is_empty()
+        && v.len() <= 16
+        && v.starts_with(|c: char| c.is_ascii_digit())
+        && v.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if ok {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(format!("et_version {v:?} must be digits and dots, like 8.0.0")))
+    }
+}
+
 fn check_user(u: &str) -> Result<(), ConfigError> {
     let ok = !u.is_empty()
         && u.len() <= 64
@@ -329,6 +343,15 @@ mod tests {
             PathBuf::from("~other/x")
         );
         assert_eq!(expand_home(PathBuf::from("/a/~"), &h.0), PathBuf::from("/a/~"));
+    }
+
+    #[test]
+    fn et_version_is_digits_and_dots_only() {
+        for (v, ok) in [("8.0.0", true), ("5.0", true), ("8.0.0/../x", false), ("8?x=1", false), ("", false), (".8", false), ("8.0.0#f", false)] {
+            let h = TempHome::new("etver");
+            h.write_config(&format!("router = \"198.51.100.1\"\net_version = \"{v}\"\n"));
+            assert_eq!(Config::load(&Overrides::default(), &h.0).is_ok(), ok, "{v:?}");
+        }
     }
 
     #[test]
