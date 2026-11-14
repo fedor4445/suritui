@@ -2149,6 +2149,28 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         assert_eq!(a.mode, Mode::Sources);
     }
 
+    #[test]
+    fn a_refresh_keeps_a_highlighted_keyed_source_and_moving_clears_old_messages() {
+        let mut a = rules_app();
+        a.set_admin(Arc::new(FakeSrc { calls: Default::default() }));
+        press(&mut a, KeyCode::Esc);
+        key(&mut a, '3');
+        key(&mut a, 'e');
+        assert!(a.status.contains("already enabled"), "{}", a.status);
+        key(&mut a, 'j');
+        assert!(a.status.is_empty(), "moving drops the old message: {}", a.status);
+        // et/open, urlhaus, then the two keyed sources: the last one is index 3.
+        key(&mut a, 'j');
+        key(&mut a, 'j');
+        assert_eq!(a.src_sel, 3);
+        key(&mut a, 'R');
+        assert_eq!(a.mode, Mode::Working);
+        wait_done(&mut a);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Sources);
+        assert_eq!(a.src_sel, 3, "the keyed source stays highlighted");
+    }
+
     fn type_text(a: &mut App, t: &str) {
         for c in t.chars() {
             key(a, c);

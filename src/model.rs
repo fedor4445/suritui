@@ -132,6 +132,8 @@ pub struct App {
     pub logs: Vec<String>,
     pub log_idx: usize,
     after_done: Mode,
+    /// A finished job delivered the source lists; `dismiss_outcome` need not fetch them again.
+    sources_ready: bool,
     cache: HashMap<Range, Loaded>,
     pub mode: Mode,
     pub range: Range,
@@ -179,6 +181,7 @@ impl App {
             logs: Vec::new(),
             log_idx: 0,
             after_done: Mode::Rules,
+            sources_ready: false,
             cache: HashMap::new(),
             mode: Mode::List,
             range: Range::Today,
@@ -300,17 +303,9 @@ impl App {
 
     /// Open the Rules browser, building the catalog on first use.
     pub fn open_rules(&mut self) {
-        if self.browser.is_none() {
-            let Some(idx) = &self.rules else {
-                self.status = "no rules are loaded here".to_string();
-                return;
-            };
-            let disable = if self.cfg.local {
-                local::load_disable_conf()
-            } else {
-                DisableConf::default()
-            };
-            self.browser = Some(RulesBrowser::new(local::catalog(idx), disable));
+        if !self.ensure_browser() {
+            self.status = "no rules are loaded here".to_string();
+            return;
         }
         self.status.clear();
         self.set_mode(Mode::Rules);
@@ -349,9 +344,14 @@ impl App {
                 ..Default::default()
             },
         };
-        let n = view.enabled.len() + view.free.len();
-        self.src_sel = self.src_sel.min(n.saturating_sub(1));
+        self.set_sources(view);
+    }
+
+    /// Install a new source view; the selection stays within everything that can be picked.
+    fn set_sources(&mut self, view: SourcesView) {
         self.sources = Some(view);
+        let n = self.source_items().len();
+        self.src_sel = self.src_sel.min(n.saturating_sub(1));
     }
 
     /// The sources that can be picked: enabled ones first, then free ones.
@@ -425,6 +425,7 @@ impl App {
     }
 
     pub fn move_source(&mut self, delta: i32) {
+        self.status.clear();
         let n = self.source_items().len();
         self.src_sel = if n == 0 { 0 } else { (self.src_sel as i64 + delta as i64).clamp(0, n as i64 - 1) as usize };
     }
@@ -595,19 +596,32 @@ impl App {
         };
         let job_action = action.clone();
         std::thread::spawn(move || {
-            // Refreshing the index changes no rules, so there is nothing to re-read.
-            let rereads = !matches!(action, Action::RefreshSources);
-            let out = match admin.run(&action) {
-                Ok(lines) if !rereads => Outcome { ok: true, lines, fresh: None },
-                Ok(lines) => match admin.reload() {
-                    Ok(fresh) => Outcome { ok: true, lines, fresh: Some(fresh) },
-                    Err(e) => {
-                        let mut lines = lines;
-                        lines.push(format!("(could not re-read the rules: {e})"));
-                        Outcome { ok: true, lines, fresh: None }
-                    }
+            // Refreshing the index and suppress entries change no rules, so
+            // there is nothing to re-read.
+            let rereads = !matches!(action, Action::RefreshSources | Action::Suppress { .. });
+            let out = match &action {
+                // The fetched lists come back with the result: no second fetch afterwards.
+                Action::RefreshSources => match admin.sources(true) {
+                    Ok(list) => Outcome {
+                        ok: true,
+                        lines: vec!["The source list was refreshed from the internet.".to_string()],
+                        fresh: None,
+                        sources: Some(list),
+                    },
+                    Err(e) => Outcome { ok: false, lines: vec![e], fresh: None, sources: None },
                 },
-                Err(e) => Outcome { ok: false, lines: vec![e], fresh: None },
+                _ => match admin.run(&action) {
+                    Ok(lines) if !rereads => Outcome { ok: true, lines, fresh: None, sources: None },
+                    Ok(lines) => match admin.reload() {
+                        Ok(fresh) => Outcome { ok: true, lines, fresh: Some(fresh), sources: None },
+                        Err(e) => {
+                            let mut lines = lines;
+                            lines.push(format!("(could not re-read the rules: {e})"));
+                            Outcome { ok: true, lines, fresh: None, sources: None }
+                        }
+                    },
+                    Err(e) => Outcome { ok: false, lines: vec![e], fresh: None, sources: None },
+                },
             };
             let _ = tx.send(out);
         });
@@ -629,6 +643,7 @@ impl App {
                 ok: false,
                 lines: vec!["the change stopped unexpectedly; check the rules and Suricata".to_string()],
                 fresh: None,
+                sources: None,
             }),
         };
         let Some(o) = done else { return };
@@ -641,6 +656,10 @@ impl App {
                 None => self.browser = Some(RulesBrowser::new(entries, disable)),
             }
         }
+        if let Some(list) = o.sources {
+            self.set_sources(browser::sources_from_lines(&list));
+            self.sources_ready = true;
+        }
         self.outcome = Some((o.ok, o.lines));
         self.set_mode(Mode::Done);
     }
@@ -650,7 +669,8 @@ impl App {
         if self.after_done == Mode::Updates {
             self.load_updates();
         }
-        if self.after_done == Mode::Sources {
+        // A refresh job already brought the new lists back; anything else re-reads them.
+        if self.after_done == Mode::Sources && !std::mem::take(&mut self.sources_ready) {
             self.load_sources(false);
         }
         if self.after_done == Mode::Thresholds {
@@ -719,6 +739,13 @@ impl App {
         self.scroll.top = usize::MAX;
     }
 
+    /// `R` on Logs: read the log again and show its end. The scroll position is
+    /// clamped when drawn, so it does not depend on the old log's length.
+    pub fn reload_logs(&mut self) {
+        self.load_logs();
+        self.scroll.top = usize::MAX;
+    }
+
     pub fn load_logs(&mut self) {
         let name = self.log_name();
         let Some(a) = &self.admin else { return };
@@ -743,7 +770,10 @@ impl App {
     pub fn load_thresholds(&mut self) {
         if let Some(a) = &self.admin {
             match a.thresholds() {
-                Ok(v) => self.thresholds = v,
+                Ok(v) => {
+                    self.thresholds = v;
+                    self.status.clear();
+                }
                 Err(e) => {
                     self.thresholds.clear();
                     self.status = e;
@@ -754,6 +784,7 @@ impl App {
     }
 
     pub fn move_threshold(&mut self, delta: i32) {
+        self.status.clear();
         let n = self.thresholds.len();
         if n == 0 {
             self.thr_sel = 0;

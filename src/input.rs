@@ -77,10 +77,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (Mode::Settings | Mode::Logs, KeyCode::Char('1')) => app.set_mode(Mode::List),
         (Mode::Settings | Mode::Logs, KeyCode::Char('2')) => app.open_rules(),
         (Mode::Settings, KeyCode::Char('R')) => app.reload_settings(),
-        (Mode::Logs, KeyCode::Char('R')) => {
-            app.load_logs();
-            app.scroll_to_bottom();
-        }
+        (Mode::Logs, KeyCode::Char('R')) => app.reload_logs(),
         (Mode::Logs, KeyCode::Tab) => app.next_log(),
         (Mode::List | Mode::Rules | Mode::Sources | Mode::Updates | Mode::Settings | Mode::Logs, KeyCode::Char('5')) => app.open_thresholds(),
         (Mode::Thresholds, KeyCode::Char('1')) => app.set_mode(Mode::List),

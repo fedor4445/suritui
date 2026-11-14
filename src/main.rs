@@ -165,6 +165,10 @@ fn run_tui(cfg: Config) -> std::io::Result<()> {
                 // A change is running: wake up often to show progress and
                 // pick up the result.
                 app.poll_job();
+                if app.job.is_none() {
+                    // The result just arrived: draw it before any key can act on it.
+                    continue;
+                }
                 if !event::poll(std::time::Duration::from_millis(250))? {
                     continue;
                 }

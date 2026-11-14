@@ -203,6 +203,8 @@ pub struct Outcome {
     pub ok: bool,
     pub lines: Vec<String>,
     pub fresh: Option<(RuleIndex, DisableConf)>,
+    /// The source lists, when the job was a refresh of them.
+    pub sources: Option<Vec<String>>,
 }
 
 pub struct Job {
