@@ -723,7 +723,7 @@ fn draw_working(f: &mut Frame, app: &App, area: Rect) {
 fn working_note(action: Option<&Action>) -> &'static str {
     match action {
         Some(Action::RefreshSources) => {
-            "Fetching the list only. No rules change and Suricata is not reloaded. Please wait and do not close this window."
+            "Fetching the list only: no rules change, Suricata is not reloaded. Do not close this window."
         }
         Some(Action::Suppress { .. }) => {
             "Checking the suppress list and reloading Suricata. Please wait and do not close this window."
@@ -881,7 +881,7 @@ mod tests {
     #[test]
     fn the_working_note_matches_what_the_action_really_does() {
         let refresh = working_note(Some(&Action::RefreshSources));
-        assert!(refresh.contains("No rules change"), "{refresh}");
+        assert!(refresh.contains("no rules change"), "{refresh}");
         assert!(!refresh.contains("Rebuilding"), "{refresh}");
         let sup = working_note(Some(&Action::Suppress {
             add: true,
@@ -894,6 +894,10 @@ mod tests {
             assert!(working_note(Some(&a)).starts_with("Rebuilding the rules"));
         }
         assert!(working_note(None).starts_with("Rebuilding the rules"));
+        // Short enough to sit on one line in a 100-column terminal (it used to wrap a lone ".").
+        for a in [None, Some(&Action::Update), Some(&Action::RefreshSources)] {
+            assert!(working_note(a).chars().count() <= 96, "{}", working_note(a));
+        }
     }
 
     fn render(app: &App, w: u16, h: u16) -> Vec<String> {

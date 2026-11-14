@@ -190,6 +190,11 @@ This builds `target/release/suritui` (the TUI) and `target/release/suritui-admin
 (the root helper, local mode only). It needs a Rust toolchain; remote mode also
 needs the `ssh` command at run time.
 
+For remote mode only, `cargo install suritui --locked` from crates.io also
+works. Do not use it for local mode: the root helper must be installed
+root-owned by `contrib/freebsd/install.sh` from a source tree (a clone of this
+repository or the unpacked crate), as described below.
+
 ## Configuration
 
 suritui reads `~/.config/suritui/config.toml`:
