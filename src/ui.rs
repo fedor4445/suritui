@@ -2339,6 +2339,18 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
     }
 
     #[test]
+    fn a_refusal_on_the_suppress_screen_is_shown() {
+        // an entry suritui did not write cannot be removed; the reason must be visible
+        let (mut a, _f) = thr_app("suppress gen_id 1, sig_id 5, track by_src, ip 10.0.0.1 # mine by hand\n");
+        key(&mut a, '5');
+        assert_eq!(a.mode, Mode::Thresholds);
+        key(&mut a, 'x');
+        assert_eq!(a.mode, Mode::Thresholds, "no confirm for an entry that is not ours");
+        let f = footer(&a, 140, 12);
+        assert!(f.contains("was not made by suritui"), "{f}");
+    }
+
+    #[test]
     fn s_on_an_alert_silences_the_rule_for_its_source() {
         let (mut a, f) = thr_app("");
         press(&mut a, KeyCode::Enter);

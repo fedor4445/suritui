@@ -1055,17 +1055,17 @@ impl App {
         if matches!(self.mode, Mode::Confirm | Mode::Working | Mode::Done) {
             return self.status.clone();
         }
-        if self.mode == Mode::Updates {
-            return "updates and status".to_string();
-        }
-        if self.mode == Mode::Thresholds {
-            return format!("{} entries", self.thresholds.len());
-        }
-        if self.mode == Mode::Settings {
-            return "settings".to_string();
-        }
-        if self.mode == Mode::Logs {
-            return format!("{} log, {} lines", self.log_name(), self.logs.len());
+        // These screens used to drop `status`, so a refusal such as "this entry
+        // was not made by suritui" or "the helper is not installed" never showed.
+        let screen = match self.mode {
+            Mode::Updates => Some("updates and status".to_string()),
+            Mode::Thresholds => Some(format!("{} entries", self.thresholds.len())),
+            Mode::Settings => Some("settings".to_string()),
+            Mode::Logs => Some(format!("{} log, {} lines", self.log_name(), self.logs.len())),
+            _ => None,
+        };
+        if let Some(base) = screen {
+            return if self.status.is_empty() { base } else { format!("{base} | {}", self.status) };
         }
         let shown = self.visible().len();
         let hidden = self.hidden_count();
