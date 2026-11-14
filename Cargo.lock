@@ -1624,6 +1624,7 @@ dependencies = [
  "serde_json",
  "tar",
  "toml",
+ "unicode-segmentation",
  "unicode-width",
  "ureq",
 ]

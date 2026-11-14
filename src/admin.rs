@@ -256,17 +256,23 @@ impl Runner for SystemRunner {
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin")
             .env("LANG", "C");
-        // The helper ignores hangup/interrupt/terminate while it changes files;
-        // an ignored signal stays ignored across exec, so children must get the
-        // defaults back or `timeout` could no longer stop them.
-        // SAFETY: only async-signal-safe `signal` calls run between fork and exec.
-        unsafe {
-            cmd.pre_exec(|| {
-                for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
-                    libc::signal(sig, libc::SIG_DFL);
-                }
-                Ok(())
-            });
+        // The helper ignores hangup/interrupt/terminate while it changes files so
+        // a started change always finishes. Children stay in step: each gets its
+        // own process group, so a group signal aimed at the helper (ssh drops,
+        // Ctrl-C) does not reach them and the reload, health check and restore
+        // still run. An ignored signal survives exec, so only `timeout` gets the
+        // defaults back, otherwise it could not stop what it supervises.
+        cmd.process_group(0);
+        if prog.rsplit('/').next() == Some("timeout") {
+            // SAFETY: only async-signal-safe `signal` calls run between fork and exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
+                        libc::signal(sig, libc::SIG_DFL);
+                    }
+                    Ok(())
+                });
+            }
         }
         let out = cmd
             .output()
@@ -1649,14 +1655,25 @@ mod tests {
     }
 
     #[test]
-    fn children_get_the_default_signals_back_even_when_the_helper_ignores_them() {
+    fn only_timeout_gets_the_default_signals_back_and_children_leave_the_group() {
         // SAFETY: plain signal() calls; the old disposition is put back at the end.
         let old = unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
-        let out = SystemRunner.run("/bin/sh", &["-c", "kill -TERM $$; echo survived"]).unwrap();
+        // an ordinary child keeps ignoring the signal, so a change under way finishes
+        let kept = SystemRunner.run("/bin/sh", &["-c", "kill -TERM $$; echo survived"]).unwrap();
+        // `timeout` can still stop what it supervises
+        let t = std::time::Instant::now();
+        let stopped = SystemRunner.run("timeout", &["1", "sleep", "20"]).unwrap();
+        // each child is its own process group leader
+        let grp = SystemRunner.run("/bin/sh", &["-c", "ps -o pgid= -p $$; ps -o pid= -p $$"]).unwrap();
         unsafe {
             libc::signal(libc::SIGTERM, old);
         }
-        assert!(!out.stdout.contains("survived"), "the child must die of SIGTERM: {}", out.stdout);
+        assert!(kept.stdout.contains("survived"), "an ordinary child keeps the ignored signal: {}", kept.stdout);
+        assert_eq!(stopped.code, Some(124), "timeout must be able to stop its child");
+        assert!(t.elapsed().as_secs() < 10);
+        let nums: Vec<&str> = grp.stdout.split_whitespace().collect();
+        assert_eq!(nums.len(), 2, "ps must print the group and the pid: {:?} {}", grp.stdout, grp.stderr);
+        assert_eq!(nums[0], nums[1], "the child leads its own process group");
     }
 
     #[test]

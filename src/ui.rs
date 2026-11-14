@@ -9,7 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const SIDEBAR_MAX: u16 = 26;
 const RULE_NOTE_1: &str = "Rule text is the hub's copy of ET Open.";
@@ -46,31 +47,37 @@ fn plain(s: &str) -> Line<'static> {
     Line::from(clean(s))
 }
 
-/// Width in terminal columns (wide characters such as CJK take two). Always the
-/// sum of the per-character widths, the same measure `take_cols` and `wrap_line`
-/// use: the whole-string width can differ for emoji sequences, and a measure
-/// that disagrees with the one used to cut text underflows the padding.
-fn cols(s: &str) -> usize {
-    s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+/// Width of one grapheme cluster, as ratatui measures it when drawing.
+fn gwidth(g: &str) -> usize {
+    UnicodeWidthStr::width(g)
 }
 
-/// The longest prefix of `s` that fits in `w` columns. A wide character that
+/// Width in terminal columns (wide characters such as CJK take two). The sum of
+/// the per-grapheme widths, the measure ratatui draws with and the one
+/// `take_cols` and `wrap_line` cut by, so padding can neither underflow nor
+/// overshoot for emoji sequences.
+fn cols(s: &str) -> usize {
+    s.graphemes(true).map(gwidth).sum()
+}
+
+/// The longest prefix of `s` that fits in `w` columns. A wide grapheme that
 /// would straddle the edge is dropped, never split.
 fn take_cols(s: &str, w: usize) -> String {
     let mut used = 0;
     let mut out = String::new();
-    for c in s.chars() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + cw > w {
+    for g in s.graphemes(true) {
+        let gw = gwidth(g);
+        if used + gw > w {
             break;
         }
-        used += cw;
-        out.push(c);
+        used += gw;
+        out.push_str(g);
     }
     out
 }
 
-/// Truncate to `w` columns (never splitting a char) and pad with spaces.
+/// Truncate to `w` columns (never splitting a grapheme cluster; a wide one that
+/// would straddle the edge is dropped whole) and pad with spaces.
 fn fit(s: &str, w: usize) -> String {
     let mut out = take_cols(&clean(s), w);
     let n = cols(&out);
@@ -339,8 +346,8 @@ fn wrap_line(line: Line<'static>, w: usize) -> Vec<Line<'static>> {
     let mut used = 0;
     for span in line.spans {
         let mut buf = String::new();
-        for c in span.content.chars() {
-            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        for g in span.content.graphemes(true) {
+            let cw = gwidth(g);
             if used > 0 && used + cw > w {
                 if !buf.is_empty() {
                     rows.last_mut()
@@ -350,7 +357,7 @@ fn wrap_line(line: Line<'static>, w: usize) -> Vec<Line<'static>> {
                 rows.push(Vec::new());
                 used = 0;
             }
-            buf.push(c);
+            buf.push_str(g);
             used += cw;
         }
         if !buf.is_empty() {
@@ -790,7 +797,7 @@ fn draw_sources(f: &mut Frame, app: &App, area: Rect) {
     rows.push((Line::default(), false));
     rows.push((Line::from("R fetches the current source list from the internet."), false));
     let at = rows.iter().position(|(_, s)| *s).unwrap_or(0);
-    let top = if h == 0 || at < h { 0 } else { at + 1 - h };
+    let top = scroll_offset(at, h);
     let mut lines = vec![Line::from(Span::styled(fit("Rule sources", w), header_style()))];
     lines.extend(rows.into_iter().skip(top).take(h).map(|(l, _)| l));
     f.render_widget(Paragraph::new(lines), area);
@@ -2556,7 +2563,6 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
 
     #[test]
     fn wide_characters_are_cut_by_columns_not_chars() {
-        // each of these takes two columns
         // An emoji sequence whose whole-string width differs from the sum of its
         // characters must not underflow the padding (it used to panic).
         let heart = "\u{2764}\u{FE0F}";
@@ -2571,6 +2577,7 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
         assert_eq!(wrap_line(wide(41), 80).len(), 2);
         assert_eq!(wrap_line(wide(3), 1).len(), 3, "a char wider than the row still moves on");
         assert_eq!(clean("a\u{1b}[31mb"), "a?[31mb");
+        // each of these takes two columns
         assert_eq!(cols("日本語"), 6);
         assert_eq!(take_cols("日本語", 5), "日本"); // the third would straddle column 5-6
         assert_eq!(take_cols("日本語", 1), "");

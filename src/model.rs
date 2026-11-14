@@ -787,6 +787,14 @@ impl App {
 
     /// `x` on the suppress list: remove the highlighted entry (only ours).
     pub fn request_unsuppress(&mut self) {
+        let Some(admin) = &self.admin else {
+            self.status = "removing works only on the router (--local)".to_string();
+            return;
+        };
+        if !admin.available() {
+            self.status = "the helper suritui-admin is not installed here".to_string();
+            return;
+        }
         let Some(e) = self.thresholds.get(self.thr_sel) else { return };
         let Some((sid, track, ip)) = e.removable.clone() else {
             self.status = "this entry was not made by suritui; edit threshold.config by hand".to_string();
