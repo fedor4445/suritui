@@ -18,6 +18,8 @@ pub const MAX_EXTRA_FLIPS: usize = 25;
 pub const KEEP_BACKUPS: usize = 5;
 /// A rebuild that takes longer than this is killed (the daily one takes ~2 minutes).
 pub const REBUILD_TIMEOUT_SECS: &str = "900";
+/// Fetching the source index is one small download; past this it is stuck.
+pub const INDEX_TIMEOUT_SECS: &str = "120";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
@@ -833,23 +835,56 @@ fn has_alert_mark(line: &[u8]) -> bool {
     line.windows(ALERT_MARK.len()).any(|w| w == ALERT_MARK)
 }
 
+/// The most alerts one `alerts` call sends: the newest ones. An alert storm
+/// (a day of millions of lines) must not fill the memory of this helper or of
+/// the TUI that reads its output.
+pub const MAX_ALERT_LINES: usize = 20_000;
+pub const MAX_ALERT_BYTES: usize = 32 * 1024 * 1024;
+/// First line of the output when older alerts were left out; `source::parse_output` reads it.
+pub const DROPPED_MARK: &str = "{\"suritui_dropped\":";
+
 fn copy_alert_lines<R: std::io::Read, W: std::io::Write>(r: R, w: &mut W) -> Result<(), ReadError> {
+    copy_newest_alerts(r, w, MAX_ALERT_LINES, MAX_ALERT_BYTES)
+}
+
+fn copy_newest_alerts<R: std::io::Read, W: std::io::Write>(
+    r: R,
+    w: &mut W,
+    max_lines: usize,
+    max_bytes: usize,
+) -> Result<(), ReadError> {
+    use std::collections::VecDeque;
     use std::io::BufRead;
     let mut r = std::io::BufReader::new(r);
+    let mut keep: VecDeque<Vec<u8>> = VecDeque::new();
+    let (mut bytes, mut dropped) = (0usize, 0usize);
     let mut line = Vec::new();
     loop {
         line.clear();
         let n = r.read_until(b'\n', &mut line).map_err(|e| ReadError::Other(io("read", e)))?;
         if n == 0 {
-            return Ok(());
+            break;
         }
         if has_alert_mark(&line) {
             if !line.ends_with(b"\n") {
                 line.push(b'\n');
             }
-            w.write_all(&line).map_err(|e| out_err("write", e))?;
+            bytes += line.len();
+            keep.push_back(line.clone());
+            // Always keep the newest line, even if it alone is over the byte cap.
+            while keep.len() > 1 && (keep.len() > max_lines || bytes > max_bytes) {
+                bytes -= keep.pop_front().map_or(0, |l| l.len());
+                dropped += 1;
+            }
         }
     }
+    if dropped > 0 {
+        writeln!(w, "{DROPPED_MARK}{dropped}}}").map_err(|e| out_err("write", e))?;
+    }
+    for l in keep {
+        w.write_all(&l).map_err(|e| out_err("write", e))?;
+    }
+    Ok(())
 }
 
 /// `alerts live` / `alerts day K`: print the alert events (raw JSON lines).
@@ -1709,5 +1744,30 @@ mod tests {
         copy_regular(&real, t.join("copy")).unwrap();
         assert_eq!(fs::read_to_string(t.join("copy")).unwrap(), "hello\n");
         let _ = fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn alert_storms_keep_only_the_newest_and_say_so() {
+        let mut log = String::new();
+        for i in 0..10 {
+            log.push_str(&format!("{{\"event_type\":\"alert\",\"n\":{i}}}\n{{\"event_type\":\"flow\"}}\n"));
+        }
+        let mut out = Vec::new();
+        copy_newest_alerts(log.as_bytes(), &mut out, 3, usize::MAX).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "{\"suritui_dropped\":7}");
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].contains("\"n\":7") && lines[3].contains("\"n\":9"), "{text}");
+        // Under the cap: nothing is marked.
+        let mut out = Vec::new();
+        copy_newest_alerts(log.as_bytes(), &mut out, 100, usize::MAX).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("dropped"));
+        // The byte cap also applies, and the newest line is always kept.
+        let mut out = Vec::new();
+        copy_newest_alerts(log.as_bytes(), &mut out, 100, 1).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.contains("\"n\":9"));
     }
 }

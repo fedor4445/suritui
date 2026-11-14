@@ -36,6 +36,8 @@ impl Range {
 pub struct Loaded {
     pub alerts: Vec<Alert>,
     pub skipped: usize,
+    /// Older alerts the helper left out to bound memory (see `admin::MAX_ALERT_LINES`).
+    pub dropped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +68,10 @@ pub fn parse_output(out: &str) -> Loaded {
         if line.trim().is_empty() {
             continue;
         }
+        if let Some(n) = line.strip_prefix(crate::admin::DROPPED_MARK) {
+            loaded.dropped = n.trim_end_matches('}').trim().parse().unwrap_or(0);
+            continue;
+        }
         match parse_line(line) {
             Some(a) => loaded.alerts.push(a),
             None => loaded.skipped += 1,
@@ -87,14 +93,25 @@ pub fn map_output(
     }
 }
 
+/// The last non-empty line of a failed command's stderr, without the helper's
+/// own `suritui-admin: ` prefix. One place, so every path words errors alike.
+pub fn last_error_line(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| l.trim_start_matches("suritui-admin: ").to_string())
+}
+
 /// One line of error text for a failed ssh run.
 fn ssh_failure_text(code: Option<i32>, stderr: &[u8]) -> String {
     let err = String::from_utf8_lossy(stderr);
     if err.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
         return "router host key CHANGED, ssh refused; check known_hosts".to_string();
     }
-    match err.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
-        Some(line) => line.to_string(),
+    match last_error_line(&err) {
+        Some(line) => line,
         None => match code {
             Some(c) => format!("ssh failed (exit {c})"),
             None => "ssh failed (killed by signal)".to_string(),
@@ -242,6 +259,12 @@ mod tests {
             s.ssh_args(Range::Day(2))[10..],
             ["--", "alertview@198.51.100.1", "day", "2"]
         );
+    }
+
+    #[test]
+    fn the_dropped_marker_is_not_a_skipped_line() {
+        let l = parse_output("{\"suritui_dropped\":1234}\n");
+        assert_eq!((l.dropped, l.skipped, l.alerts.len()), (1234, 0, 0));
     }
 
     #[test]

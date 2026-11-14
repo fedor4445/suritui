@@ -64,7 +64,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         (Mode::List, KeyCode::Char('R')) => app.refresh(),
         (Mode::List, KeyCode::Char('?')) => app.set_mode(Mode::Help),
         (Mode::List, KeyCode::Char('2')) => app.open_rules(),
-        (Mode::List, KeyCode::Char('3')) => app.open_sources(),
+        (Mode::List | Mode::Thresholds | Mode::Settings | Mode::Logs, KeyCode::Char('3')) => app.open_sources(),
         (Mode::List | Mode::Rules | Mode::Sources | Mode::Updates | Mode::Settings | Mode::Logs, KeyCode::Char('4')) => {
             app.open_updates()
         }

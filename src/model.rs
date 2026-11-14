@@ -330,11 +330,14 @@ impl App {
     }
 
     /// `R` on the Sources screen: fetch the current source index from the internet.
+    /// It is a network fetch, so it runs as a background job (the Working
+    /// screen keeps reading keys) and the helper bounds it with a timeout.
     pub fn reload_sources(&mut self) {
-        self.load_sources(true);
-        if self.sources.as_ref().is_some_and(|v| v.error.is_none()) {
-            self.status = "source list refreshed from the internet".to_string();
+        if self.admin.is_none() {
+            return;
         }
+        self.status.clear();
+        self.start_job(Action::RefreshSources, Mode::Sources);
     }
 
     pub fn load_sources(&mut self, refresh: bool) {
@@ -574,22 +577,28 @@ impl App {
 
     /// The confirming second keystroke: start the helper in the background.
     pub fn confirm_change(&mut self) {
-        let (Some(p), Some(admin)) = (self.pending.take(), self.admin.clone()) else {
-            return;
-        };
+        let Some(p) = self.pending.take() else { return };
+        self.start_job(p.action, p.from);
+    }
+
+    /// Run `action` on a thread and show the Working screen until it ends.
+    fn start_job(&mut self, action: Action, from: Mode) {
+        let Some(admin) = self.admin.clone() else { return };
         let (tx, rx) = std::sync::mpsc::channel();
-        let action = p.action;
         // Back to where the change started: the alert list for an alert's rule.
-        self.after_done = match (&action, p.from) {
+        self.after_done = match (&action, from) {
             (Action::Update, _) => Mode::Updates,
-            (Action::Source { .. } | Action::SourceKey { .. }, _) => Mode::Sources,
+            (Action::Source { .. } | Action::SourceKey { .. } | Action::RefreshSources, _) => Mode::Sources,
             (Action::Suppress { .. }, Mode::Thresholds) => Mode::Thresholds,
             (_, Mode::Detail | Mode::Rule) => Mode::List,
             _ => Mode::Rules,
         };
         let job_action = action.clone();
         std::thread::spawn(move || {
+            // Refreshing the index changes no rules, so there is nothing to re-read.
+            let rereads = !matches!(action, Action::RefreshSources);
             let out = match admin.run(&action) {
+                Ok(lines) if !rereads => Outcome { ok: true, lines, fresh: None },
                 Ok(lines) => match admin.reload() {
                     Ok(fresh) => Outcome { ok: true, lines, fresh: Some(fresh) },
                     Err(e) => {
@@ -726,14 +735,20 @@ impl App {
             self.status = "suppress entries are only available on the router (use --local)".to_string();
             return;
         }
-        self.load_thresholds();
         self.status.clear();
+        self.load_thresholds();
         self.set_mode(Mode::Thresholds);
     }
 
     pub fn load_thresholds(&mut self) {
         if let Some(a) = &self.admin {
-            self.thresholds = a.thresholds();
+            match a.thresholds() {
+                Ok(v) => self.thresholds = v,
+                Err(e) => {
+                    self.thresholds.clear();
+                    self.status = e;
+                }
+            }
         }
         self.thr_sel = self.thr_sel.min(self.thresholds.len().saturating_sub(1));
     }
@@ -1084,6 +1099,10 @@ impl App {
         if skipped > 0 {
             s.push_str(&format!(", {skipped} lines skipped"));
         }
+        let dropped = self.cache.get(&self.range).map_or(0, |l| l.dropped);
+        if dropped > 0 {
+            s.push_str(&format!(", {} older alerts not loaded", group(dropped)));
+        }
         if !self.status.is_empty() {
             s.push_str(" | ");
             s.push_str(&self.status);
@@ -1162,6 +1181,7 @@ mod tests {
                 Some(Ok(v)) => Ok(Loaded {
                     alerts: v.clone(),
                     skipped: self.skipped,
+                    dropped: 0,
                 }),
                 Some(Err(e)) => Err(e.clone()),
                 None => Ok(Loaded::default()),

@@ -58,18 +58,37 @@ fn var(lines: &[&str], name: &str) -> Option<String> {
 }
 
 /// `(name, enabled)` of each entry under `outputs:`.
+///
+/// Only the outputs themselves count: entries at the indent of the first `- `,
+/// and the `enabled:` that is a direct child of one. Deeper `- name:` lines
+/// (eve-log's `types:` list) and their own `enabled:` keys are not outputs.
 fn outputs(lines: &[&str]) -> Vec<(String, String)> {
     let b = block(lines, "outputs");
     let mut out: Vec<(String, String)> = Vec::new();
+    let Some(top) = b.iter().map(|l| strip_comment(l)).find(|c| c.trim_start().starts_with("- ")).map(indent) else {
+        return out;
+    };
+    // The indent of the current output's own keys, fixed by its first child line.
+    let mut child: Option<usize> = None;
     for l in b {
         let c = strip_comment(l);
         let t = c.trim();
-        if let Some(name) = t.strip_prefix("- ").and_then(|r| r.strip_suffix(':')) {
-            out.push((name.trim().to_string(), String::new()));
-        } else if let Some(v) = t.strip_prefix("enabled:") {
-            if let Some(last) = out.last_mut() {
-                if last.1.is_empty() {
-                    last.1 = unquote(v);
+        if t.is_empty() {
+            continue;
+        }
+        let at = indent(c);
+        if at == top {
+            child = None;
+            if let Some(name) = t.strip_prefix("- ").and_then(|r| r.strip_suffix(':')) {
+                out.push((name.trim().to_string(), String::new()));
+            }
+        } else if at > top {
+            let level = *child.get_or_insert(at);
+            if at == level {
+                if let (Some(v), Some(last)) = (t.strip_prefix("enabled:"), out.last_mut()) {
+                    if last.1.is_empty() {
+                        last.1 = unquote(v);
+                    }
                 }
             }
         }
@@ -158,6 +177,12 @@ outputs:
   - eve-log:
       enabled: yes
       filetype: regular
+      types:
+        - alert:
+            xff:
+              enabled: no
+        - anomaly:
+            enabled: yes
   - stats:
       enabled: yes # comment
 default-rule-path: /var/lib/suricata/rules
@@ -187,6 +212,7 @@ unix-command:
         assert!(s.contains("threshold file   default"), "{s}");
         assert!(s.contains("log directory    /var/log/suricata/"), "{s}");
         assert!(s.contains("fast (off), eve-log (on), stats (on)"), "{s}");
+        assert!(!s.contains("anomaly") && !s.contains("alert ("), "{s}");
         assert!(s.contains("command socket   auto"), "{s}");
         assert!(s.contains("read-only"));
     }

@@ -43,6 +43,7 @@ impl AlertSource for Fake {
             Some(v) => Ok(Loaded {
                 alerts: v.clone(),
                 skipped: 0,
+                dropped: 0,
             }),
             None if r == Range::Today => Ok(Loaded::default()),
             None => Err(SourceError::NoSuchDay),

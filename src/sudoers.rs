@@ -6,7 +6,6 @@ use crate::local::HELPER;
 /// Every helper command the TUI may run through `sudo -n`. `*` and `[0-9]`
 /// are sudoers patterns; the helper validates its own arguments again.
 const COMMANDS: &[&str] = &[
-    "status",
     "info",
     "update",
     "rules",
@@ -37,6 +36,9 @@ pub fn valid_user(u: &str) -> bool {
         && (b[0].is_ascii_alphabetic() || b[0] == b'_')
         && b.iter().all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(c))
         && u != "root"
+        // sudoers reads `ALL` and any all-capitals word as a keyword or a
+        // User_Alias, so such a name could grant the helper to more than one account.
+        && !(b[0].is_ascii_uppercase() && b.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_'))
 }
 
 /// The whole file for `user`.
@@ -77,10 +79,16 @@ mod tests {
 
     #[test]
     fn odd_account_names_are_refused() {
-        for bad in ["", "root", "a b", "a;b", "-x", "a\nb", "a:b", &"a".repeat(33), "x,y"] {
+        for bad in ["", "root", "a b", "a;b", "-x", "a\nb", "a:b", &"a".repeat(33), "x,y", "ALL", "ADMINS", "A_1"] {
             assert!(render(bad).is_err(), "{bad:?}");
         }
         assert!(render("_svc-1.x").is_ok());
+    }
+
+    #[test]
+    fn only_commands_the_tui_runs_are_granted() {
+        // `status` is a helper verb, but no TUI screen calls it.
+        assert!(!COMMANDS.iter().any(|c| c.starts_with("status")));
     }
 
     #[test]

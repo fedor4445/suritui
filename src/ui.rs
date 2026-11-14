@@ -612,6 +612,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
         Action::Rule(crate::admin::Verb::Disable, sid) => format!("Disable rule {sid}?"),
         Action::Rule(crate::admin::Verb::Enable, sid) => format!("Enable rule {sid}?"),
         Action::Update => "Update the rules now?".to_string(),
+        Action::RefreshSources => "Refresh the source list?".to_string(),
         Action::SourceKey { name, .. } => format!("Store the code and switch on {}?", clean(name)),
         Action::Source { enable: true, name } => format!("Switch on the source {}?", clean(name)),
         Action::Source { enable: false, name } => format!("Switch off the source {}?", clean(name)),
@@ -711,6 +712,7 @@ fn draw_working(f: &mut Frame, app: &App, area: Rect) {
             match &j.action {
                 Action::Rule(v, sid) => format!("{} rule {sid}", v.word()),
                 Action::Update => "updating the rules".to_string(),
+                Action::RefreshSources => "fetching the current source list".to_string(),
                 Action::SourceKey { name, .. } => format!("storing the code for {} and installing its rules", clean(name)),
                 Action::Source { enable, name } => {
                     format!("{} the source {}", if *enable { "switching on" } else { "switching off" }, clean(name))
@@ -2315,8 +2317,8 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
             }
             Ok(vec![format!("done {add}")])
         }
-        fn thresholds(&self) -> Vec<ThresholdEntry> {
-            self.entries.lock().unwrap().clone()
+        fn thresholds(&self) -> Result<Vec<ThresholdEntry>, String> {
+            Ok(self.entries.lock().unwrap().clone())
         }
         fn reload(&self) -> Result<(RuleIndex, DisableConf), String> {
             Ok((RuleIndex::from_text(RULES), DisableConf::default()))

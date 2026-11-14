@@ -205,7 +205,18 @@ pub fn list(paths: &Paths, runner: &dyn Runner, refresh: bool) -> Result<Report,
     if refresh {
         // The index that ships with suricata-update goes stale (some sources
         // disappear); this fetches the current one.
-        must(paths, runner, &["update-sources"])?;
+        // A stalled download must not hang the helper: `timeout` ends it.
+        let o = runner.run(
+            "/usr/bin/timeout",
+            &[crate::admin::INDEX_TIMEOUT_SECS, &paths.suricata_update, "update-sources"],
+        )?;
+        if o.code == Some(124) {
+            return Err("fetching the source list timed out; check the router's internet access".to_string());
+        }
+        if o.code != Some(0) {
+            let tail: Vec<&str> = o.stderr.lines().chain(o.stdout.lines()).rev().take(2).collect();
+            return Err(redact(paths, &format!("suricata-update update-sources failed: {}", tail.join(" | "))));
+        }
     }
     let en = must(paths, runner, &["list-enabled-sources"])?;
     let all = must(paths, runner, &["list-sources"])?;
@@ -411,6 +422,10 @@ mod tests {
                 }
                 ("su", ["enable-source", n]) => {
                     fs::write(self.dir.join(file_name(n)), format!("source: {n}\n")).unwrap();
+                    out(0, "")
+                }
+                ("/usr/bin/timeout", [_, _, "update-sources"]) => {
+                    self.calls.borrow_mut().push("su update-sources".to_string());
                     out(0, "")
                 }
                 ("/usr/bin/timeout", _) => {

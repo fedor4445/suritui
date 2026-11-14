@@ -34,6 +34,8 @@ pub enum Action {
     Source { enable: bool, name: String },
     /// Store a key for a source that needs one and switch it on.
     SourceKey { name: String, key: Secret },
+    /// Fetch the current source index from the internet (no confirm step: it changes no rules).
+    RefreshSources,
 }
 
 /// What the user is being asked to confirm.
@@ -77,8 +79,8 @@ pub trait Admin: Send + Sync {
         Err("suppressing is not available here".to_string())
     }
     /// The entries of threshold.config.
-    fn thresholds(&self) -> Vec<ThresholdEntry> {
-        Vec::new()
+    fn thresholds(&self) -> Result<Vec<ThresholdEntry>, String> {
+        Ok(Vec::new())
     }
     /// Lines of the read-only Settings screen.
     fn settings(&self) -> Vec<String> {
@@ -95,6 +97,10 @@ pub trait Admin: Send + Sync {
             Action::Source { enable, name } => self.source(*enable, name),
             Action::SourceKey { name, key } => self.source_key(name, &key.0),
             Action::Suppress { add, sid, track, ip } => self.suppress(*add, *sid, *track, ip),
+            Action::RefreshSources => {
+                self.sources(true)?;
+                Ok(vec!["The source list was refreshed from the internet.".to_string()])
+            }
         }
     }
     /// Read the rules again after a change.
@@ -129,13 +135,8 @@ fn run_helper_with(args: &[&str], stdin: Option<&str>) -> Result<Vec<String>, St
     if out.status.success() {
         return Ok(stdout.lines().map(str::to_string).collect());
     }
-    let msg = stderr
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("the helper failed without a message");
-    Err(msg.trim_start_matches("suritui-admin: ").to_string())
+    Err(crate::source::last_error_line(&stderr)
+        .unwrap_or_else(|| "the helper failed without a message".to_string()))
 }
 
 pub struct LocalAdmin;
@@ -188,10 +189,8 @@ impl Admin for LocalAdmin {
         run_helper(&["log", name])
     }
 
-    fn thresholds(&self) -> Vec<ThresholdEntry> {
-        std::fs::read_to_string(crate::local::THRESHOLD_CONF)
-            .map(|t| crate::threshold::parse_entries(&t))
-            .unwrap_or_default()
+    fn thresholds(&self) -> Result<Vec<ThresholdEntry>, String> {
+        local::load_thresholds()
     }
 
     fn reload(&self) -> Result<(RuleIndex, DisableConf), String> {
