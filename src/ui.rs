@@ -7,9 +7,9 @@ use crate::source::Range;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 const SIDEBAR_MAX: u16 = 26;
 const RULE_NOTE_1: &str = "Rule text is the hub's copy of ET Open.";
@@ -21,7 +21,6 @@ fn header_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Truncate to `w` chars (never splitting a char) and pad with spaces.
 /// Replace control characters (C0, DEL, C1) and bidi overrides/isolates with
 /// `?`. All text that did not originate in this program passes through here
 /// (via `fit`, `field`, `plain`) before it becomes a span.
@@ -37,14 +36,22 @@ fn clean(s: &str) -> String {
         .collect()
 }
 
+/// First visible row so that row `sel` is on screen in a window of `h` rows.
+fn scroll_offset(sel: usize, h: usize) -> usize {
+    if h == 0 || sel < h { 0 } else { sel + 1 - h }
+}
+
 /// A line of untrusted text.
 fn plain(s: &str) -> Line<'static> {
     Line::from(clean(s))
 }
 
-/// Width in terminal columns (wide characters such as CJK take two).
+/// Width in terminal columns (wide characters such as CJK take two). Always the
+/// sum of the per-character widths, the same measure `take_cols` and `wrap_line`
+/// use: the whole-string width can differ for emoji sequences, and a measure
+/// that disagrees with the one used to cut text underflows the padding.
 fn cols(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
 }
 
 /// The longest prefix of `s` that fits in `w` columns. A wide character that
@@ -63,10 +70,11 @@ fn take_cols(s: &str, w: usize) -> String {
     out
 }
 
+/// Truncate to `w` columns (never splitting a char) and pad with spaces.
 fn fit(s: &str, w: usize) -> String {
     let mut out = take_cols(&clean(s), w);
     let n = cols(&out);
-    out.extend(std::iter::repeat_n(' ', w - n));
+    out.extend(std::iter::repeat_n(' ', w.saturating_sub(n)));
     out
 }
 
@@ -124,9 +132,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         Mode::Rules if app.can_change() => "  / search   s state   d disable   e enable   Enter rule   1 alerts",
         Mode::Rules => "  / search   s state   c clear   Enter rule   1 alerts   3 sources",
+        Mode::Sources if !app.can_change() => "  j k move   1 alerts   2 rules   4 updates   Esc back",
         Mode::Sources => "  j k move   e switch on   d switch off   R refresh list   1 alerts   2 rules   Esc back",
         Mode::Updates if app.can_change() => "  U update now   R reload   1 alerts   2 rules   3 sources",
         Mode::Updates => "  R reload   1 alerts   2 rules   3 sources",
+        Mode::Thresholds if !app.can_change() => "  R reload   1 alerts   2 rules   4 updates",
         Mode::Thresholds => "  x remove   R reload   1 alerts   2 rules   4 updates",
         Mode::Settings => "  R reload   1 alerts   2 rules   4 updates   7 logs",
         Mode::Logs => "  Tab next log   R reload   G end   1 alerts   6 settings",
@@ -186,7 +196,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .position(|(label, _)| *label == app.category())
         .unwrap_or(0);
-    let offset = if h == 0 || sel < h { 0 } else { sel + 1 - h };
+    let offset = scroll_offset(sel, h);
     let mut lines = vec![head];
     for (label, n) in cats.iter().skip(offset).take(h) {
         let count = n.to_string();
@@ -257,7 +267,7 @@ fn row_line(app: &App, a: &Alert, width: usize, selected: bool) -> Line<'static>
     let mut left = width;
     let mut push = |text: String, style: Style, spans: &mut Vec<Span<'static>>| {
         let cell: String = take_cols(&clean(&text), left);
-        left -= cols(&cell);
+        left = left.saturating_sub(cols(&cell));
         spans.push(Span::styled(cell, style));
     };
     let action_blocked = a.action != "allowed" && a.action != "-";
@@ -299,7 +309,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(msg));
     } else {
         let sel = app.selected_index();
-        let offset = if h == 0 || sel < h { 0 } else { sel + 1 - h };
+        let offset = scroll_offset(sel, h);
         for (i, a) in rows.iter().enumerate().skip(offset).take(h) {
             lines.push(row_line(app, a, w, i == sel));
         }
@@ -321,8 +331,7 @@ fn field_styled(name: &str, value: &str, style: Style) -> Line<'static> {
     ])
 }
 
-/// Hard-wrap a line at `w` characters (the program counts characters, not
-/// display cells, everywhere), keeping span styles. An empty line stays one
+/// Hard-wrap a line at `w` display columns, keeping span styles. An empty line stays one
 /// row, so the result is exactly the rows the screen will show.
 fn wrap_line(line: Line<'static>, w: usize) -> Vec<Line<'static>> {
     let w = w.max(1);
@@ -331,7 +340,8 @@ fn wrap_line(line: Line<'static>, w: usize) -> Vec<Line<'static>> {
     for span in line.spans {
         let mut buf = String::new();
         for c in span.content.chars() {
-            if used == w {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if used > 0 && used + cw > w {
                 if !buf.is_empty() {
                     rows.last_mut()
                         .unwrap()
@@ -341,7 +351,7 @@ fn wrap_line(line: Line<'static>, w: usize) -> Vec<Line<'static>> {
                 used = 0;
             }
             buf.push(c);
-            used += 1;
+            used += cw;
         }
         if !buf.is_empty() {
             rows.last_mut().unwrap().push(Span::styled(buf, span.style));
@@ -476,7 +486,7 @@ fn category_rows(
     title: &str,
 ) -> Vec<Line<'static>> {
     let sel = cats.iter().position(|(c, _)| c == current).unwrap_or(0);
-    let offset = if h == 0 || sel < h { 0 } else { sel + 1 - h };
+    let offset = scroll_offset(sel, h);
     let mut lines = vec![Line::from(Span::styled(fit(title, w), header_style()))];
     for (label, n) in cats.iter().skip(offset).take(h) {
         let count = n.to_string();
@@ -522,7 +532,7 @@ fn draw_rules_list(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from("No rules match."));
     } else {
         let sel = b.selected_index();
-        let offset = if h == 0 || sel < h { 0 } else { sel + 1 - h };
+        let offset = scroll_offset(sel, h);
         for (i, e) in rows.iter().enumerate().skip(offset).take(h) {
             let base = if i == sel {
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -545,7 +555,7 @@ fn draw_rules_list(f: &mut Frame, app: &App, area: Rect) {
                 (e.msg.clone(), base),
             ] {
                 let cell: String = take_cols(&clean(&text), left);
-                left -= cols(&cell);
+                left = left.saturating_sub(cols(&cell));
                 spans.push(Span::styled(cell, style));
             }
             lines.push(Line::from(spans));
@@ -595,9 +605,9 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
         Action::Rule(crate::admin::Verb::Disable, sid) => format!("Disable rule {sid}?"),
         Action::Rule(crate::admin::Verb::Enable, sid) => format!("Enable rule {sid}?"),
         Action::Update => "Update the rules now?".to_string(),
-        Action::SourceKey { name, .. } => format!("Store the code and switch on {name}?"),
-        Action::Source { enable: true, name } => format!("Switch on the source {name}?"),
-        Action::Source { enable: false, name } => format!("Switch off the source {name}?"),
+        Action::SourceKey { name, .. } => format!("Store the code and switch on {}?", clean(name)),
+        Action::Source { enable: true, name } => format!("Switch on the source {}?", clean(name)),
+        Action::Source { enable: false, name } => format!("Switch off the source {}?", clean(name)),
         Action::Suppress { add: true, sid, track, ip } => format!(
             "Silence rule {sid} for {} {ip}?",
             if *track == crate::threshold::Track::BySrc { "source" } else { "destination" }
@@ -638,11 +648,15 @@ fn draw_thresholds(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from("No entries. Open an alert and press s (source) or S (destination) to silence its rule for one host."));
     } else {
         let sel = app.thr_sel.min(app.thresholds.len() - 1);
-        let offset = if h == 0 || sel < h { 0 } else { sel + 1 - h };
+        let offset = scroll_offset(sel, h);
         for (i, e) in app.thresholds.iter().enumerate().skip(offset).take(h) {
+            // The marker is added after cutting the line, so it is never the part
+            // that gets lost on a narrow screen.
+            const BY_HAND: &str = "   (edit by hand)";
             let mut text = e.line.clone();
             if e.removable.is_none() {
-                text.push_str("   (edit by hand)");
+                text = take_cols(&clean(&text), w.saturating_sub(cols(BY_HAND)));
+                text.push_str(BY_HAND);
             }
             let style = if i == sel {
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -690,9 +704,9 @@ fn draw_working(f: &mut Frame, app: &App, area: Rect) {
             match &j.action {
                 Action::Rule(v, sid) => format!("{} rule {sid}", v.word()),
                 Action::Update => "updating the rules".to_string(),
-                Action::SourceKey { name, .. } => format!("storing the code for {name} and installing its rules"),
+                Action::SourceKey { name, .. } => format!("storing the code for {} and installing its rules", clean(name)),
                 Action::Source { enable, name } => {
-                    format!("{} the source {name}", if *enable { "switching on" } else { "switching off" })
+                    format!("{} the source {}", if *enable { "switching on" } else { "switching off" }, clean(name))
                 }
                 Action::Suppress { add: true, sid, .. } => format!("silencing rule {sid}"),
                 Action::Suppress { add: false, sid, .. } => format!("removing the suppress entry of rule {sid}"),
@@ -743,7 +757,10 @@ fn draw_sources(f: &mut Frame, app: &App, area: Rect) {
         return f.render_widget(Paragraph::new("Not loaded."), area);
     };
     if let Some(e) = &v.error {
-        return f.render_widget(Paragraph::new(format!("Could not read the sources: {e}")), area);
+        return f.render_widget(
+            Paragraph::new(clean(&format!("Could not read the sources: {e}"))).wrap(Wrap { trim: false }),
+            area,
+        );
     }
     let sel = app.src_sel.min((v.enabled.len() + v.free.len() + v.keyed.len()).saturating_sub(1));
     // (line, is the selected row)
@@ -784,7 +801,7 @@ fn draw_key_entry(f: &mut Frame, app: &App, area: Rect) {
         return f.render_widget(Paragraph::new("Nothing to enter."), area);
     };
     let mut lines = vec![
-        Line::from(Span::styled(format!("Code for {}", e.name), Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!("Code for {}", clean(&e.name)), Style::default().add_modifier(Modifier::BOLD))),
         plain(&e.summary),
         Line::default(),
     ];
@@ -2540,6 +2557,20 @@ alert tcp any any -> any any (msg:\"ET INFO plain thing\"; sid:2000003; rev:1;)
     #[test]
     fn wide_characters_are_cut_by_columns_not_chars() {
         // each of these takes two columns
+        // An emoji sequence whose whole-string width differs from the sum of its
+        // characters must not underflow the padding (it used to panic).
+        let heart = "\u{2764}\u{FE0F}";
+        for w in 0..6 {
+            let _ = fit(heart, w);
+            let _ = fit(&format!("a{heart}b{heart}"), w);
+        }
+        assert_eq!(cols(&fit(heart, 4)), 4);
+        // wrapping counts columns: 40 wide characters in 80 columns are one row, 41 are two
+        let wide = |n: usize| Line::from("日".repeat(n));
+        assert_eq!(wrap_line(wide(40), 80).len(), 1);
+        assert_eq!(wrap_line(wide(41), 80).len(), 2);
+        assert_eq!(wrap_line(wide(3), 1).len(), 3, "a char wider than the row still moves on");
+        assert_eq!(clean("a\u{1b}[31mb"), "a?[31mb");
         assert_eq!(cols("日本語"), 6);
         assert_eq!(take_cols("日本語", 5), "日本"); // the third would straddle column 5-6
         assert_eq!(take_cols("日本語", 1), "");
