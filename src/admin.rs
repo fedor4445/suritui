@@ -195,9 +195,9 @@ pub fn check_rule_diff(live: &str, cand: &str, sid: u64, verb: Verb) -> Result<V
             "{text_changed} rules changed text; the cache is not what produced the live rules. Run the daily update first"
         )));
     }
-    let Some((live_state, _)) = l.get(&sid) else {
+    if !l.contains_key(&sid) {
         return Err(other(format!("sid {sid} is not in the live rules")));
-    };
+    }
     let want = verb.wants_enabled();
     let cand_state = c[&sid].0;
     if cand_state != want {
@@ -206,9 +206,6 @@ pub fn check_rule_diff(live: &str, cand: &str, sid: u64, verb: Verb) -> Result<V
              cannot be turned off, and a rule switched off by a group needs enable.conf)",
             if cand_state { "enabled" } else { "disabled" }
         )));
-    }
-    if *live_state == want && flips.contains(&sid) {
-        return Err(other("internal inconsistency in the diff".into()));
     }
     let mut extra: Vec<u64> = flips.into_iter().filter(|k| *k != sid).collect();
     extra.sort_unstable();
@@ -323,6 +320,15 @@ impl Paths {
     }
 }
 
+/// A fresh backup directory under the root-only backup root; returns it and its name.
+pub(crate) fn new_backup_dir(paths: &Paths) -> Result<(PathBuf, String), String> {
+    let stamp = format!("{}-{}", ymd(now()), now());
+    let backup = paths.backup_root.join(&stamp);
+    fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
+    let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
+    Ok((backup, stamp))
+}
+
 pub(crate) fn io(what: &str, e: std::io::Error) -> String {
     format!("{what}: {e}")
 }
@@ -330,15 +336,26 @@ pub(crate) fn io(what: &str, e: std::io::Error) -> String {
 pub(crate) struct Lock(PathBuf);
 
 impl Lock {
+    fn publish(path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(format!(".{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        let _ = fs::remove_file(&tmp);
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode_0600().open(&tmp)?;
+        let r = writeln!(f, "{}", std::process::id()).and_then(|_| f.sync_all());
+        let r = r.and_then(|_| fs::hard_link(&tmp, path));
+        let _ = fs::remove_file(&tmp);
+        r
+    }
+
     pub(crate) fn take(path: &Path, runner: &dyn Runner) -> Result<Lock, String> {
         for attempt in 0..2 {
-            match fs::OpenOptions::new().write(true).create_new(true).open(path) {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{}", std::process::id());
-                    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-                    return Ok(Lock(path.to_path_buf()));
-                }
+            // The pid is written into a private file first and then linked into
+            // place, so the lock never exists without its pid: a second run can
+            // not read it empty and take it for stale.
+            match Self::publish(path) {
+                Ok(()) => return Ok(Lock(path.to_path_buf())),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
                     let pid = read_regular(path).unwrap_or_default();
                     let pid = pid.trim();
@@ -544,12 +561,11 @@ pub(crate) fn reload(paths: &Paths, runner: &dyn Runner) -> Result<(), String> {
             if why.is_empty() { "no answer from Suricata: is it running?" } else { &why }
         ));
     }
-    // Without a timestamp to compare there is nothing to wait for; the caller's
-    // health check still runs.
-    let Some(before) = before else { return Ok(()) };
+    // Without a timestamp from before, a reload counts as finished once one
+    // shows up; if none ever does, it cannot be confirmed and is treated as failed.
     let start = std::time::Instant::now();
     loop {
-        if last_reload(paths, runner).is_some_and(|now| now != before) {
+        if last_reload(paths, runner).is_some_and(|now| before.as_ref().is_none_or(|b| now != *b)) {
             break;
         }
         if start.elapsed() >= std::time::Duration::from_secs(paths.reload_wait_secs) {
@@ -667,18 +683,7 @@ fn rebuild(paths: &Paths, runner: &dyn Runner, cand: &Candidate) -> Result<Strin
 /// reload fails the previous files are put back and reloaded again.
 pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result<Report, String> {
     let mut rep = Report::default();
-    if paths.require_root {
-        let id = runner.run("/usr/bin/id", &["-u"])?;
-        if id.stdout.trim() != "0" {
-            return Err("suritui-admin must run as root (through sudo)".into());
-        }
-    }
-    let _lock = Lock::take(&paths.lock, runner)?;
-    for p in ["suricata-update", "suricata-update-reload"] {
-        if runner.run("/bin/pgrep", &["-f", p]).map(|o| o.code == Some(0)).unwrap_or(false) {
-            return Err("a rule update is running right now; try again after it finishes".into());
-        }
-    }
+    let _lock = crate::update::begin(paths, runner)?;
 
     let rules_meta = plain_file(&paths.rules)?;
     let dc_meta = plain_file(&paths.disable_conf)?;
@@ -735,10 +740,7 @@ pub fn apply(paths: &Paths, runner: &dyn Runner, verb: Verb, sid: u64) -> Result
     };
 
     // Back up now that every check has passed (refused attempts leave nothing behind).
-    let stamp = format!("{}-{}", ymd(now()), now());
-    let backup = paths.backup_root.join(&stamp);
-    fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
-    let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
+    let (backup, stamp) = new_backup_dir(paths)?;
     copy_regular(&paths.disable_conf, backup.join("disable.conf")).map_err(|e| io("backup of disable.conf", e))?;
     if ec_exists {
         copy_regular(&paths.enable_conf, backup.join("enable.conf")).map_err(|e| io("backup of enable.conf", e))?;
@@ -864,12 +866,19 @@ pub fn read_log<W: std::io::Write>(paths: &Paths, name: &str, w: &mut W) -> Resu
     let mut f = open_plain(path)?;
     let len = f.metadata().map_err(|e| ReadError::Other(io("stat", e)))?.len();
     let from = len.saturating_sub(LOG_TAIL_BYTES);
-    f.seek(SeekFrom::Start(from)).map_err(|e| ReadError::Other(io("seek", e)))?;
+    // One byte more at the front tells whether the window starts on a line
+    // boundary (then the first line is whole and stays).
+    let start_at = from.saturating_sub(1);
+    f.seek(SeekFrom::Start(start_at)).map_err(|e| ReadError::Other(io("seek", e)))?;
     let mut buf = Vec::new();
-    f.take(LOG_TAIL_BYTES).read_to_end(&mut buf).map_err(|e| ReadError::Other(io("read", e)))?;
-    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    f.take(LOG_TAIL_BYTES + (from - start_at)).read_to_end(&mut buf).map_err(|e| ReadError::Other(io("read", e)))?;
+    let on_boundary = from > 0 && buf.first() == Some(&b'\n');
     if from > 0 {
-        // The first line is probably cut in half.
+        buf.remove(0);
+    }
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if from > 0 && !on_boundary {
+        // The first line is cut in half.
         if let Some(i) = text.find('\n') {
             text.drain(..=i);
         }
@@ -1592,6 +1601,37 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn the_lock_always_holds_its_pid() {
+        let t = std::env::temp_dir().join(format!("suritui-lockpid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&t);
+        fs::create_dir_all(&t).unwrap();
+        let path = t.join("lock");
+        let f = Fake::ok(String::new());
+        let l = Lock::take(&path, &f).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), std::process::id().to_string());
+        assert_eq!(fs::read_dir(&t).unwrap().count(), 1, "no staging file is left behind");
+        drop(l);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_log_tail_starting_on_a_line_boundary_keeps_its_first_line() {
+        let (_t, p) = setup("tailbound", &rules(&[R_ON]), "");
+        let line = "x".repeat(63) + "\n"; // 64 bytes: 96 KiB is an exact multiple
+        let n = (LOG_TAIL_BYTES as usize) / line.len();
+        let text = format!("first\n{}", line.repeat(n + 1));
+        // make the window start exactly after a newline
+        let cut = text.len() - LOG_TAIL_BYTES as usize;
+        let text = format!("{}\n{}", "y".repeat(cut - 1), &text[cut..]);
+        fs::write(&p.suricata_log, &text).unwrap();
+        let mut out = Vec::new();
+        read_log(&p, "suricata", &mut out).unwrap();
+        let shown = String::from_utf8(out).unwrap();
+        assert!(!shown.contains('y'), "the padding before the window is not shown");
+        assert!(shown.lines().next().is_some_and(|l| l.len() == 63), "first shown line is whole");
     }
 
     #[test]

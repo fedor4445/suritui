@@ -5,11 +5,10 @@
 //!   suppress gen_id 1, sig_id N, track by_src|by_dst, ip ADDR[/PREFIX]
 
 use crate::admin::{
-    commit_swaps, io, log_line, now, plain_file, prune_backups, rule_map, say, Lock, Paths, Report, Runner, Swap,
+    commit_swaps, io, log_line, now, plain_file, prune_backups, rule_map, say, Paths, Report, Runner, Swap,
 };
 use std::fs;
 use std::net::IpAddr;
-use std::os::unix::fs::PermissionsExt;
 
 /// More entries than this means something is wrong (or someone is scripting).
 pub const MAX_ENTRIES: usize = 200;
@@ -145,23 +144,15 @@ pub fn apply_suppress(
 ) -> Result<Report, String> {
     let mut rep = Report::default();
     let ip = parse_ip_spec(ip).ok_or("not a valid address")?;
-    if paths.require_root {
-        let id = runner.run("/usr/bin/id", &["-u"])?;
-        if id.stdout.trim() != "0" {
-            return Err("suritui-admin must run as root (through sudo)".into());
+    let _lock = crate::update::begin(paths, runner)?;
+    // Only adding needs the rule to exist; an entry for a rule an update has
+    // since removed must still be deletable.
+    if add {
+        let live = crate::admin::read_regular(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
+        if !rule_map(&live).contains_key(&sid) {
+            return Err(format!("sid {sid} is not in the live rules"));
         }
     }
-    let _lock = Lock::take(&paths.lock, runner)?;
-    for p in ["suricata-update", "suricata-update-reload"] {
-        if runner.run("/bin/pgrep", &["-f", p]).map(|o| o.code == Some(0)).unwrap_or(false) {
-            return Err("a rule update is running right now; try again after it finishes".into());
-        }
-    }
-    let live = crate::admin::read_regular(&paths.rules).map_err(|e| io("cannot read the live rules", e))?;
-    if !rule_map(&live).contains_key(&sid) {
-        return Err(format!("sid {sid} is not in the live rules"));
-    }
-    drop(live);
     let exists = paths.threshold_conf.exists() || fs::symlink_metadata(&paths.threshold_conf).is_ok();
     let meta = if exists { plain_file(&paths.threshold_conf)? } else { plain_file(&paths.disable_conf)? };
     let old = if exists {
@@ -184,19 +175,19 @@ pub fn apply_suppress(
     let check = fs::write(&cand, &new).map_err(|e| io("cannot write the candidate", e)).and_then(|_| {
         let set = format!("threshold-file={}", cand.display());
         let yaml = paths.suricata_yaml.to_string_lossy().into_owned();
-        runner.run("/usr/bin/timeout", &["120", &paths.suricata_bin, "-T", "-c", &yaml, "--set", &set])
+        runner.run("/usr/bin/timeout", &["300", &paths.suricata_bin, "-T", "-c", &yaml, "--set", &set])
     });
     let _ = fs::remove_dir_all(&paths.build_dir);
     let o = check?;
+    if o.code == Some(124) {
+        return Err("checking the new threshold.config took longer than 5 minutes; nothing was changed".into());
+    }
     if o.code != Some(0) {
         let why: Vec<&str> = o.stdout.lines().chain(o.stderr.lines()).filter(|l| l.contains("hreshold") || l.contains("rror")).take(2).collect();
         return Err(format!("Suricata rejected the new threshold.config: {}", why.join(" | ")));
     }
 
-    let stamp = format!("{}-{}", crate::admin::ymd(now()), now());
-    let backup = paths.backup_root.join(&stamp);
-    fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
-    let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
+    let (backup, stamp) = crate::admin::new_backup_dir(paths)?;
     if exists {
         crate::admin::copy_regular(&paths.threshold_conf, backup.join("threshold.config")).map_err(|e| io("backup of threshold.config", e))?;
     }
@@ -404,6 +395,15 @@ mod tests {
         let b = fs::read_dir(&p.backup_root).unwrap().next().unwrap().unwrap().path();
         assert_eq!(fs::read_to_string(b.join("threshold.config")).unwrap(), "# default\n");
         assert!(!p.build_dir.exists() && !p.lock.exists());
+    }
+
+    #[test]
+    fn an_entry_for_a_rule_that_is_gone_can_still_be_removed() {
+        let (_t, p) = setup("gone", Some("# default\nsuppress gen_id 1, sig_id 999, track by_src, ip 10.0.0.9\n"));
+        // sid 999 is not in the live rules any more
+        assert!(apply_suppress(&p, &fake(), true, 999, Track::BySrc, "10.0.0.8").is_err());
+        apply_suppress(&p, &fake(), false, 999, Track::BySrc, "10.0.0.9").unwrap();
+        assert_eq!(fs::read_to_string(&p.threshold_conf).unwrap(), "# default\n");
     }
 
     #[test]

@@ -6,7 +6,6 @@ use crate::admin::{
     Report, Runner, Swap, REBUILD_TIMEOUT_SECS,
 };
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 /// An update that would leave fewer than this share of the current rules is
@@ -258,7 +257,9 @@ pub(crate) fn update_locked(paths: &Paths, runner: &dyn Runner, strict: bool) ->
     cleanup();
 
     let (l, c) = (rule_map(&live_rules), rule_map(&cand_rules));
-    if c.is_empty() || c.len() * 100 < l.len() * MIN_KEPT_PERCENT {
+    // A source switch on purpose changes the size a lot, and a failed download
+    // is already fatal there (`strict`); only the plain update gets the size check.
+    if c.is_empty() || (!strict && c.len() * 100 < l.len() * MIN_KEPT_PERCENT) {
         return Err(format!(
             "the update has {} rules but {} are loaded now; that looks like a broken download, so nothing was changed",
             group(c.len()),
@@ -278,10 +279,7 @@ pub(crate) fn update_locked(paths: &Paths, runner: &dyn Runner, strict: bool) ->
         return Ok(rep);
     }
 
-    let stamp_s = format!("{}-{}", crate::admin::ymd(now()), now());
-    let backup = paths.backup_root.join(&stamp_s);
-    fs::create_dir_all(&backup).map_err(|e| io("cannot create the backup directory", e))?;
-    let _ = fs::set_permissions(&paths.backup_root, fs::Permissions::from_mode(0o700));
+    let (backup, stamp_s) = crate::admin::new_backup_dir(paths)?;
     crate::admin::copy_regular(&paths.rules, backup.join("suricata.rules")).map_err(|e| io("backup of the rules", e))?;
     for f in [&paths.disable_conf, &paths.enable_conf, &class_path] {
         if f.is_file() {

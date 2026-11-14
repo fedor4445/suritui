@@ -83,6 +83,17 @@ fn main() -> ExitCode {
             }
         };
     }
+    // From here on the verb changes live files. If ssh or sudo goes away halfway
+    // (hangup, Ctrl-C, terminate), the change must still run to its end so the
+    // reload, the health check and any restore happen; the lock goes with it.
+    // SIGKILL cannot be caught, but then nothing has been left half-written:
+    // every file is replaced atomically.
+    for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
+        // SAFETY: setting a signal to "ignore" has no handler code to run.
+        unsafe {
+            libc::signal(sig, libc::SIG_IGN);
+        }
+    }
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["status"] => Ok(status(&paths, &runner)),
         ["info"] => Ok(info(&paths, &runner)),
@@ -118,8 +129,9 @@ fn main() -> ExitCode {
             // Printing comes after the work is done, so a reader that went away
             // (`| head`) must not turn a finished change into a panic.
             let mut out = std::io::stdout().lock();
-            for l in rep.lines {
-                if let Err(e) = writeln!(out, "{}", suritui::sources::redact(&paths, &l)) {
+            let text = suritui::sources::redact(&paths, &rep.lines.join("\n"));
+            for l in text.lines() {
+                if let Err(e) = writeln!(out, "{l}") {
                     return print_failed(&e);
                 }
             }

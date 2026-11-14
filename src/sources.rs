@@ -291,8 +291,8 @@ pub fn change(paths: &Paths, runner: &dyn Runner, enable: bool, name: &str) -> R
         if !is_on {
             return Err(format!("{name} is not enabled"));
         }
-        if name == DEFAULT_SOURCE && enabled.len() <= 1 {
-            return Err("et/open is the only source; at least one must stay".into());
+        if enabled.len() <= 1 {
+            return Err(format!("{name} is the only source; enable another one first, at least one must stay"));
         }
         transact(paths, runner, &format!("source disabled {name}"), rep, |_| remove_source_file(paths, name))
     }
