@@ -727,9 +727,23 @@ fn draw_working(f: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         Line::from(format!("Working: {what} ... {secs}s")),
         Line::default(),
-        Line::from("Rebuilding the rules and reloading Suricata. Please wait and do not close this window."),
+        Line::from(working_note(app.job.as_ref().map(|j| &j.action))),
     ];
     scroll_screen(f, app, area, "Working", lines);
+}
+
+/// What the helper is really doing, so the Working screen never claims a
+/// rule rebuild or a reload that will not happen.
+fn working_note(action: Option<&Action>) -> &'static str {
+    match action {
+        Some(Action::RefreshSources) => {
+            "Fetching the list only. No rules change and Suricata is not reloaded. Please wait and do not close this window."
+        }
+        Some(Action::Suppress { .. }) => {
+            "Checking the suppress list and reloading Suricata. Please wait and do not close this window."
+        }
+        _ => "Rebuilding the rules and reloading Suricata. Please wait and do not close this window.",
+    }
 }
 
 fn draw_done(f: &mut Frame, app: &App, area: Rect) {
@@ -877,6 +891,24 @@ mod tests {
     use crate::testutil::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn the_working_note_matches_what_the_action_really_does() {
+        let refresh = working_note(Some(&Action::RefreshSources));
+        assert!(refresh.contains("No rules change"), "{refresh}");
+        assert!(!refresh.contains("Rebuilding"), "{refresh}");
+        let sup = working_note(Some(&Action::Suppress {
+            add: true,
+            sid: 1,
+            track: crate::threshold::Track::BySrc,
+            ip: "192.0.2.1".to_string(),
+        }));
+        assert!(sup.contains("suppress list") && !sup.contains("Rebuilding"), "{sup}");
+        for a in [Action::Update, Action::Rule(crate::admin::Verb::Disable, 1)] {
+            assert!(working_note(Some(&a)).starts_with("Rebuilding the rules"));
+        }
+        assert!(working_note(None).starts_with("Rebuilding the rules"));
+    }
 
     fn render(app: &App, w: u16, h: u16) -> Vec<String> {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
