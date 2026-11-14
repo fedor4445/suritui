@@ -343,11 +343,19 @@ refreshing returns you to the list.
 - Snort's registered rules do **not** load in Suricata 8 (Suricata refuses
   some of their syntax). suritui does not offer them; a failed load is rolled
   back, but there is no point in trying.
-- Silencing an alert from the alert screen (`s` / `S`) has unit tests but no
-  live run against a real alert yet.
+- Silencing an alert from the alert screen (`s` / `S`) has unit tests and one
+  live run on the router (one rule silenced for one source address, then
+  logged and loaded without a restart). Only that one case was tried.
+- The 120-second limit on refreshing the source list (the message
+  "fetching the source list timed out") and the cap of 20,000 alerts per read
+  (the status line then says how many older alerts were not loaded) have unit
+  tests but were never triggered on a real router or VM.
 - The installer's "put the old sudoers file back" path has not been triggered
   on a real machine.
-- Nobody but the author has read the helper. It runs as root; read
+- No human other than the author has read the code. The whole code base went
+  through AI-assisted code reviews (Claude's cloud code review, run on the
+  root helper, the core, the model and the screens separately); their findings
+  were fixed. That is not a security audit. The helper runs as root: read
   `src/bin/suritui-admin.rs`, `src/admin.rs`, `src/update.rs` and
   `src/sources.rs` before you install it.
 
