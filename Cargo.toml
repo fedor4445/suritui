@@ -3,6 +3,7 @@ name = "suritui"
 version = "0.1.0"
 edition = "2021"
 license = "BSD-2-Clause"
+repository = "https://github.com/fedor4445/suritui"
 description = "A terminal UI for Suricata alerts and rule management on a FreeBSD router (read-only over ssh, or local with a small sudo helper)"
 
 [dependencies]
