@@ -81,6 +81,18 @@ program you just built, and puts the old sudoers file back if the combined
 sudoers files stop parsing. It does not touch Suricata or its files. Read it
 before you run it; it is short.
 
+To remove suritui again, nothing else on the router depends on it:
+
+```
+sudo sh contrib/freebsd/uninstall.sh            # add --and-prev to drop the *.prev copies too
+```
+
+It removes only the two programs and the sudoers file (and checks that the sudoers
+files still parse). Suricata is not touched, stopped or reloaded, and the files
+suritui edited (`disable.conf`, `enable.conf`, `threshold.config`) stay as they
+are: they are ordinary Suricata files, so rules you switched off stay off.
+Your `~/.config/suritui` is left for you to delete.
+
 Optional, once, to switch rule sources and store keys from screen 3:
 
 ```
@@ -338,8 +350,8 @@ refreshing returns you to the list.
 ## What it has not been tested on
 
 - One router (FreeBSD, Suricata 8.0.7, passive `--pcap`, ET Open) and one
-  FreeBSD test VM. Other FreeBSD versions, Suricata versions, pfSense/OPNsense
-  layouts and Linux are untested; Linux is not a goal.
+  FreeBSD test VM. Other FreeBSD versions, Suricata versions, router
+  layouts that differ from a plain FreeBSD install and Linux are untested; Linux is not a goal.
 - Inline IPS setups: untested, not supported.
 - Rule sources other than ET Open and a free source (`oisf/trafficid`): the
   paid ET Pro style key flow was rehearsed against the real servers with a
