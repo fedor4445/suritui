@@ -350,8 +350,8 @@ refreshing returns you to the list.
 ## What it has not been tested on
 
 - One router (FreeBSD, Suricata 8.0.7, passive `--pcap`, ET Open) and one
-  FreeBSD test VM. Other FreeBSD versions, Suricata versions, pfSense/OPNsense
-  layouts and Linux are untested; Linux is not a goal.
+  FreeBSD test VM. Other FreeBSD versions, Suricata versions, router
+  layouts that differ from a plain FreeBSD install and Linux are untested; Linux is not a goal.
 - Inline IPS setups: untested, not supported.
 - Rule sources other than ET Open and a free source (`oisf/trafficid`): the
   paid ET Pro style key flow was rehearsed against the real servers with a
